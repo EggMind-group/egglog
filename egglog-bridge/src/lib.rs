@@ -180,6 +180,11 @@ impl EGraph {
         EGraph::create_internal(db, uf_table, true)
     }
 
+    /// Returns whether proof tracing is enabled.
+    pub fn tracing(&self) -> bool {
+        self.tracing
+    }
+
     fn create_internal(mut db: Database, uf_table: TableId, tracing: bool) -> EGraph {
         let id_counter = db.add_counter();
         let trace_counter = db.add_counter();
@@ -451,6 +456,39 @@ impl EGraph {
         self.get_canon_in_uf(res)
     }
 
+    /// Add a term and return its stable term id when tracing is enabled.
+    pub fn add_term_id(&mut self, func: FunctionId, inputs: &[Value], desc: &str) -> Value {
+        if !self.tracing {
+            return self.add_term(func, inputs, desc);
+        }
+        let reason = self.get_fiat_reason(desc);
+        let term_id = self.get_term(func, inputs, reason);
+        let info = &self.funcs[func];
+        let schema_math = SchemaMath {
+            tracing: self.tracing,
+            subsume: info.can_subsume,
+            func_cols: info.schema.len(),
+        };
+        let mut extended_row = Vec::new();
+        extended_row.extend_from_slice(inputs);
+        schema_math.write_table_row(
+            &mut extended_row,
+            RowVals {
+                timestamp: self.next_ts().to_value(),
+                ret_val: Some(term_id),
+                proof: Some(term_id),
+                subsume: schema_math.subsume.then_some(NOT_SUBSUMED),
+            },
+        );
+        let table_id = info.table;
+        self.db
+            .get_table(table_id)
+            .new_buffer()
+            .stage_insert(&extended_row);
+        self.flush_updates();
+        self.canonicalize_term_id(term_id)
+    }
+
     /// Get an id corresponding to the given term, inserting the value into the
     /// corresponding terms table if it isn't there.
     ///
@@ -490,6 +528,22 @@ impl EGraph {
         let table = self.db.get_table(table_id);
         let row = table.get_row(key)?;
         Some(row.vals[schema_math.ret_val_col()])
+    }
+
+    /// Lookup the stable term id for a function and arguments when tracing is enabled.
+    pub fn lookup_term_id(&mut self, func: FunctionId, key: &[Value]) -> Option<Value> {
+        if !self.tracing {
+            return self.lookup_id(func, key);
+        }
+        let table_id = self.funcs[func].table;
+        let term_table_id = self.term_table(table_id);
+        let table = self.db.get_table(term_table_id);
+        let mut term_key = Vec::with_capacity(key.len() + 1);
+        term_key.push(Value::new(func.rep()));
+        term_key.extend_from_slice(key);
+        table
+            .get_row(&term_key)
+            .map(|row| self.canonicalize_term_id(row.vals[row.vals.len() - 2]))
     }
 
     fn get_fiat_reason(&mut self, desc: &str) -> Value {

@@ -284,8 +284,14 @@ impl Debug for Function {
 
 impl Default for EGraph {
     fn default() -> Self {
+        Self::new_with_backend(Default::default())
+    }
+}
+
+impl EGraph {
+    fn new_with_backend(backend: egglog_bridge::EGraph) -> Self {
         let mut eg = Self {
-            backend: Default::default(),
+            backend,
             parser: Default::default(),
             names: Default::default(),
             pushed_egraph: Default::default(),
@@ -331,6 +337,67 @@ impl Default for EGraph {
             .insert("".into(), Ruleset::Rules(Default::default()));
 
         eg
+    }
+
+    /// Construct an e-graph with proof tracing enabled.
+    pub fn with_tracing() -> Self {
+        Self::new_with_backend(egglog_bridge::EGraph::with_tracing())
+    }
+
+    /// Generate a proof explaining why an expression exists in the e-graph.
+    pub fn explain_expr(&mut self, expr: &Expr) -> Result<(String, Vec<String>), Error> {
+        let (_sort, value) = self.lookup_expr_term(expr)?;
+        self.explain_value(value)
+    }
+
+    /// Generate a proof explaining why two expressions are equal in the e-graph.
+    pub fn explain_exprs_equal(
+        &mut self,
+        lhs: &Expr,
+        rhs: &Expr,
+    ) -> Result<(String, Vec<String>), Error> {
+        let (_lhs_sort, lhs_value) = self.lookup_expr_term(lhs)?;
+        let (_rhs_sort, rhs_value) = self.lookup_expr_term(rhs)?;
+        self.explain_values_equal(lhs_value, rhs_value)
+    }
+
+    /// Generate a proof explaining why a value exists in the e-graph.
+    pub fn explain_value(&mut self, value: Value) -> Result<(String, Vec<String>), Error> {
+        let mut store = egglog_bridge::ProofStore::default();
+        let proof = self
+            .backend
+            .explain_term(value, &mut store)
+            .map_err(|e| Error::BackendError(e.to_string()))?;
+        let mut buf = Vec::new();
+        store
+            .print_term_proof(proof, &mut buf)
+            .map_err(|e| Error::BackendError(e.to_string()))?;
+        let proof_text = String::from_utf8(buf).map_err(|e| Error::BackendError(e.to_string()))?;
+        Ok((proof_text, store.term_rule_trace(proof)))
+    }
+
+    /// Generate a proof explaining why two values are equal in the e-graph.
+    pub fn explain_values_equal(
+        &mut self,
+        lhs: Value,
+        rhs: Value,
+    ) -> Result<(String, Vec<String>), Error> {
+        let mut store = egglog_bridge::ProofStore::default();
+        let proof = self
+            .backend
+            .explain_terms_equal(lhs, rhs, &mut store)
+            .map_err(|e| Error::BackendError(e.to_string()))?;
+        let mut buf = Vec::new();
+        store
+            .print_eq_proof(proof, &mut buf)
+            .map_err(|e| Error::BackendError(e.to_string()))?;
+        let proof_text = String::from_utf8(buf).map_err(|e| Error::BackendError(e.to_string()))?;
+        Ok((proof_text, store.eq_rule_trace(proof)))
+    }
+
+    /// Returns whether proof tracing is enabled on the backend.
+    pub fn is_tracing(&self) -> bool {
+        self.backend.tracing()
     }
 }
 
@@ -777,8 +844,11 @@ impl EGraph {
             ruleset: &str,
             rulesets: &IndexMap<String, Ruleset>,
             ids: &mut Vec<egglog_bridge::RuleId>,
-        ) {
-            match &rulesets[ruleset] {
+        ) -> Result<(), Error> {
+            let entry = rulesets
+                .get(ruleset)
+                .ok_or_else(|| Error::NoSuchRuleset(ruleset.to_owned(), span!()))?;
+            match entry {
                 Ruleset::Rules(rules) => {
                     for (_, id) in rules.values() {
                         ids.push(*id);
@@ -786,18 +856,85 @@ impl EGraph {
                 }
                 Ruleset::Combined(sub_rulesets) => {
                     for sub_ruleset in sub_rulesets {
-                        collect_rule_ids(sub_ruleset, rulesets, ids);
+                        collect_rule_ids(sub_ruleset, rulesets, ids)?;
                     }
                 }
             }
+            Ok(())
         }
 
         let mut rule_ids = Vec::new();
-        collect_rule_ids(ruleset, &self.rulesets, &mut rule_ids);
+        collect_rule_ids(ruleset, &self.rulesets, &mut rule_ids)?;
 
         let iteration_report = self
             .backend
             .run_rules(&rule_ids)
+            .map_err(|e| Error::BackendError(e.to_string()))?;
+
+        Ok(RunReport::singleton(ruleset, iteration_report))
+    }
+
+    /// Return the flattened rule names contained in a ruleset.
+    pub fn ruleset_rule_names(&self, ruleset: &str) -> Result<Vec<String>, Error> {
+        fn collect_rule_names(
+            ruleset: &str,
+            rulesets: &IndexMap<String, Ruleset>,
+            names: &mut Vec<String>,
+        ) -> Result<(), Error> {
+            let entry = rulesets
+                .get(ruleset)
+                .ok_or_else(|| Error::NoSuchRuleset(ruleset.to_owned(), span!()))?;
+            match entry {
+                Ruleset::Rules(rules) => {
+                    names.extend(rules.keys().cloned());
+                }
+                Ruleset::Combined(sub_rulesets) => {
+                    for sub_ruleset in sub_rulesets {
+                        collect_rule_names(sub_ruleset, rulesets, names)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        let mut names = Vec::new();
+        collect_rule_names(ruleset, &self.rulesets, &mut names)?;
+        Ok(names)
+    }
+
+    /// Run a single named rule from a ruleset for one iteration.
+    pub fn step_rule(&mut self, ruleset: &str, rule_name: &str) -> Result<RunReport, Error> {
+        fn find_rule_id(
+            ruleset: &str,
+            rule_name: &str,
+            rulesets: &IndexMap<String, Ruleset>,
+        ) -> Result<Option<egglog_bridge::RuleId>, Error> {
+            let entry = rulesets
+                .get(ruleset)
+                .ok_or_else(|| Error::NoSuchRuleset(ruleset.to_owned(), span!()))?;
+            match entry {
+                Ruleset::Rules(rules) => Ok(rules.get(rule_name).map(|(_, id)| *id)),
+                Ruleset::Combined(sub_rulesets) => {
+                    for sub_ruleset in sub_rulesets {
+                        if let Some(rule_id) = find_rule_id(sub_ruleset, rule_name, rulesets)? {
+                            return Ok(Some(rule_id));
+                        }
+                    }
+                    Ok(None)
+                }
+            }
+        }
+
+        let rule_id = find_rule_id(ruleset, rule_name, &self.rulesets)?.ok_or_else(|| {
+            Error::NotFoundError(NotFoundError(format!(
+                "rule '{}' not found in ruleset '{}'",
+                rule_name, ruleset
+            )))
+        })?;
+
+        let iteration_report = self
+            .backend
+            .run_rules(&[rule_id])
             .map_err(|e| Error::BackendError(e.to_string()))?;
 
         Ok(RunReport::singleton(ruleset, iteration_report))
@@ -877,6 +1014,54 @@ impl EGraph {
         Ok((sort, value))
     }
 
+    /// Insert a concrete expression into the e-graph without using a temporary rule.
+    pub fn add_expr(&mut self, expr: &Expr) -> Result<(ArcSort, Value), Error> {
+        let span = expr.span();
+        let command = Command::Action(Action::Expr(span.clone(), expr.clone()));
+        let resolved_commands = self.process_command(command)?;
+        assert_eq!(resolved_commands.len(), 1);
+        let resolved_command = resolved_commands.into_iter().next().unwrap();
+        let resolved_expr = match resolved_command {
+            ResolvedNCommand::CoreAction(ResolvedAction::Expr(_, resolved_expr)) => resolved_expr,
+            _ => unreachable!(),
+        };
+        let sort = resolved_expr.output_type();
+        let value = self.add_resolved_expr(&resolved_expr)?;
+        Ok((sort, value))
+    }
+
+    /// Look up an existing expression without inserting new rows.
+    pub fn lookup_expr(&mut self, expr: &Expr) -> Result<(ArcSort, Value), Error> {
+        let span = expr.span();
+        let command = Command::Action(Action::Expr(span.clone(), expr.clone()));
+        let resolved_commands = self.process_command(command)?;
+        assert_eq!(resolved_commands.len(), 1);
+        let resolved_command = resolved_commands.into_iter().next().unwrap();
+        let resolved_expr = match resolved_command {
+            ResolvedNCommand::CoreAction(ResolvedAction::Expr(_, resolved_expr)) => resolved_expr,
+            _ => unreachable!(),
+        };
+        let sort = resolved_expr.output_type();
+        let value = self.lookup_resolved_expr(&resolved_expr)?;
+        Ok((sort, value))
+    }
+
+    /// Look up an existing expression and preserve its stable term id when tracing is enabled.
+    pub fn lookup_expr_term(&mut self, expr: &Expr) -> Result<(ArcSort, Value), Error> {
+        let span = expr.span();
+        let command = Command::Action(Action::Expr(span.clone(), expr.clone()));
+        let resolved_commands = self.process_command(command)?;
+        assert_eq!(resolved_commands.len(), 1);
+        let resolved_command = resolved_commands.into_iter().next().unwrap();
+        let resolved_expr = match resolved_command {
+            ResolvedNCommand::CoreAction(ResolvedAction::Expr(_, resolved_expr)) => resolved_expr,
+            _ => unreachable!(),
+        };
+        let sort = resolved_expr.output_type();
+        let value = self.lookup_resolved_expr_term(&resolved_expr)?;
+        Ok((sort, value))
+    }
+
     fn eval_resolved_expr(&mut self, span: Span, expr: &ResolvedExpr) -> Result<Value, Error> {
         let unit_id = self.backend.base_values().get_ty::<()>();
         let unit_val = self.backend.base_values().get(());
@@ -934,6 +1119,128 @@ impl EGraph {
 
         let result = result.lock().unwrap().unwrap();
         Ok(result)
+    }
+
+    fn add_resolved_expr(&mut self, expr: &ResolvedExpr) -> Result<Value, Error> {
+        match expr {
+            ResolvedExpr::Lit(_, literal) => Ok(literal_to_value(&self.backend, literal)),
+            ResolvedExpr::Var(span, var) => {
+                if var.is_global_ref {
+                    self.lookup_function(&var.name, &[]).ok_or_else(|| {
+                        Error::NotFoundError(NotFoundError(format!(
+                            "{span}: global {} not found",
+                            var.name
+                        )))
+                    })
+                } else {
+                    Err(Error::BackendError(format!(
+                        "{span}: cannot add local variable {} outside a rule context",
+                        var.name
+                    )))
+                }
+            }
+            ResolvedExpr::Call(_, resolved_call, args) => match resolved_call {
+                ResolvedCall::Func(func) => {
+                    let key = args
+                        .iter()
+                        .map(|arg| self.add_resolved_expr(arg))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let function_id = self.functions[&func.name].backend_id;
+                    if self.is_tracing() {
+                        Ok(self
+                            .backend
+                            .add_term_id(function_id, &key, &expr.to_string()))
+                    } else {
+                        Ok(self.backend.add_term(function_id, &key, &expr.to_string()))
+                    }
+                }
+                ResolvedCall::Primitive(prim) => Err(Error::BackendError(format!(
+                    "cannot add primitive expression {} without evaluation",
+                    prim.primitive.0.name()
+                ))),
+            },
+        }
+    }
+
+    fn lookup_resolved_expr_term(&mut self, expr: &ResolvedExpr) -> Result<Value, Error> {
+        match expr {
+            ResolvedExpr::Lit(_, literal) => Ok(literal_to_value(&self.backend, literal)),
+            ResolvedExpr::Var(span, var) => {
+                if var.is_global_ref {
+                    self.lookup_function(&var.name, &[]).ok_or_else(|| {
+                        Error::NotFoundError(NotFoundError(format!(
+                            "{span}: global {} not found",
+                            var.name
+                        )))
+                    })
+                } else {
+                    Err(Error::BackendError(format!(
+                        "{span}: cannot lookup local variable {} outside a rule context",
+                        var.name
+                    )))
+                }
+            }
+            ResolvedExpr::Call(span, resolved_call, args) => match resolved_call {
+                ResolvedCall::Func(func) => {
+                    let key = args
+                        .iter()
+                        .map(|arg| self.lookup_resolved_expr_term(arg))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let function_id = self.functions[&func.name].backend_id;
+                    self.backend
+                        .lookup_term_id(function_id, &key)
+                        .ok_or_else(|| {
+                            Error::NotFoundError(NotFoundError(format!(
+                                "{span}: expression {} not found in e-graph",
+                                expr
+                            )))
+                        })
+                }
+                ResolvedCall::Primitive(prim) => Err(Error::BackendError(format!(
+                    "{span}: cannot lookup primitive expression {} without evaluation",
+                    prim.primitive.0.name()
+                ))),
+            },
+        }
+    }
+
+    fn lookup_resolved_expr(&self, expr: &ResolvedExpr) -> Result<Value, Error> {
+        match expr {
+            ResolvedExpr::Lit(_, literal) => Ok(literal_to_value(&self.backend, literal)),
+            ResolvedExpr::Var(span, var) => {
+                if var.is_global_ref {
+                    self.lookup_function(&var.name, &[]).ok_or_else(|| {
+                        Error::NotFoundError(NotFoundError(format!(
+                            "{span}: global {} not found",
+                            var.name
+                        )))
+                    })
+                } else {
+                    Err(Error::BackendError(format!(
+                        "{span}: cannot lookup local variable {} outside a rule context",
+                        var.name
+                    )))
+                }
+            }
+            ResolvedExpr::Call(span, resolved_call, args) => match resolved_call {
+                ResolvedCall::Func(func) => {
+                    let key = args
+                        .iter()
+                        .map(|arg| self.lookup_resolved_expr(arg))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    self.lookup_function(&func.name, &key).ok_or_else(|| {
+                        Error::NotFoundError(NotFoundError(format!(
+                            "{span}: expression {} not found in e-graph",
+                            expr
+                        )))
+                    })
+                }
+                ResolvedCall::Primitive(prim) => Err(Error::BackendError(format!(
+                    "{span}: cannot lookup primitive expression {} without evaluation",
+                    prim.primitive.0.name()
+                ))),
+            },
+        }
     }
 
     fn add_combined_ruleset(&mut self, name: String, rulesets: Vec<String>) {
@@ -1699,7 +2006,12 @@ impl<'a> BackendRule<'a> {
     }
 
     fn build(self) -> egglog_bridge::RuleId {
-        self.rb.build()
+        if self.rb.egraph().tracing() {
+            self.rb
+                .build_with_syntax(egglog_bridge::SourceSyntax::default())
+        } else {
+            self.rb.build()
+        }
     }
 }
 
