@@ -180,11 +180,6 @@ impl EGraph {
         EGraph::create_internal(db, uf_table, true)
     }
 
-    /// Returns whether proof tracing is enabled.
-    pub fn tracing(&self) -> bool {
-        self.tracing
-    }
-
     fn create_internal(mut db: Database, uf_table: TableId, tracing: bool) -> EGraph {
         let id_counter = db.add_counter();
         let trace_counter = db.add_counter();
@@ -287,7 +282,7 @@ impl EGraph {
 
     pub fn register_external_func(
         &mut self,
-        func: impl ExternalFunction + 'static,
+        func: Box<dyn ExternalFunction + 'static>,
     ) -> ExternalFunctionId {
         self.db.add_external_function(func)
     }
@@ -448,45 +443,9 @@ impl EGraph {
         );
         extended_row[schema_math.ret_val_col()] = res;
         let table_id = self.funcs[func].table;
-        self.db
-            .get_table(table_id)
-            .new_buffer()
-            .stage_insert(&extended_row);
+        self.db.new_buffer(table_id).stage_insert(&extended_row);
         self.flush_updates();
         self.get_canon_in_uf(res)
-    }
-
-    /// Add a term and return its stable term id when tracing is enabled.
-    pub fn add_term_id(&mut self, func: FunctionId, inputs: &[Value], desc: &str) -> Value {
-        if !self.tracing {
-            return self.add_term(func, inputs, desc);
-        }
-        let reason = self.get_fiat_reason(desc);
-        let term_id = self.get_term(func, inputs, reason);
-        let info = &self.funcs[func];
-        let schema_math = SchemaMath {
-            tracing: self.tracing,
-            subsume: info.can_subsume,
-            func_cols: info.schema.len(),
-        };
-        let mut extended_row = Vec::new();
-        extended_row.extend_from_slice(inputs);
-        schema_math.write_table_row(
-            &mut extended_row,
-            RowVals {
-                timestamp: self.next_ts().to_value(),
-                ret_val: Some(term_id),
-                proof: Some(term_id),
-                subsume: schema_math.subsume.then_some(NOT_SUBSUMED),
-            },
-        );
-        let table_id = info.table;
-        self.db
-            .get_table(table_id)
-            .new_buffer()
-            .stage_insert(&extended_row);
-        self.flush_updates();
-        self.canonicalize_term_id(term_id)
     }
 
     /// Get an id corresponding to the given term, inserting the value into the
@@ -506,10 +465,7 @@ impl EGraph {
             let result = Value::from_usize(self.db.inc_counter(self.id_counter));
             term_key.push(result);
             term_key.push(reason);
-            self.db
-                .get_table(term_table_id)
-                .new_buffer()
-                .stage_insert(&term_key);
+            self.db.new_buffer(term_table_id).stage_insert(&term_key);
             self.db.merge_table(term_table_id);
             result
         }
@@ -530,30 +486,13 @@ impl EGraph {
         Some(row.vals[schema_math.ret_val_col()])
     }
 
-    /// Lookup the stable term id for a function and arguments when tracing is enabled.
-    pub fn lookup_term_id(&mut self, func: FunctionId, key: &[Value]) -> Option<Value> {
-        if !self.tracing {
-            return self.lookup_id(func, key);
-        }
-        let table_id = self.funcs[func].table;
-        let term_table_id = self.term_table(table_id);
-        let table = self.db.get_table(term_table_id);
-        let mut term_key = Vec::with_capacity(key.len() + 1);
-        term_key.push(Value::new(func.rep()));
-        term_key.extend_from_slice(key);
-        table
-            .get_row(&term_key)
-            .map(|row| self.canonicalize_term_id(row.vals[row.vals.len() - 2]))
-    }
-
     fn get_fiat_reason(&mut self, desc: &str) -> Value {
         let reason = Arc::new(ProofReason::Fiat { desc: desc.into() });
         let reason_table = self.reason_table(&reason);
         let reason_spec_id = self.proof_specs.push(reason);
         let reason_id = Value::from_usize(self.db.inc_counter(self.reason_counter));
         self.db
-            .get_table(reason_table)
-            .new_buffer()
+            .new_buffer(reason_table)
             .stage_insert(&[Value::new(reason_spec_id.rep()), reason_id]);
         self.db.merge_table(reason_table);
         reason_id
@@ -587,9 +526,7 @@ impl EGraph {
             let term_id = reason_id.map(|reason| {
                 // Get the term id itself
                 let term_id = self.get_term(func, &row[0..schema_math.num_keys()], reason);
-                let buf = bufs.get_or_insert(self.uf_table, || {
-                    self.db.get_table(self.uf_table).new_buffer()
-                });
+                let buf = bufs.get_or_insert(self.uf_table, || self.db.new_buffer(self.uf_table));
                 // Then union it with the value being set for this term.
                 buf.stage_insert(&[
                     *row.last().unwrap(),
@@ -609,7 +546,7 @@ impl EGraph {
                     ret_val: None, // already filled in.
                 },
             );
-            let buf = bufs.get_or_insert(table_id, || self.db.get_table(table_id).new_buffer());
+            let buf = bufs.get_or_insert(table_id, || self.db.new_buffer(table_id));
             buf.stage_insert(&extended_row);
             extended_row.clear();
         }
@@ -1724,8 +1661,9 @@ impl ExternalFunction for GetFirstMatch {
 struct LazyPanic<F>(Arc<Lazy<String, F>>, SideChannel<String>);
 
 impl<F: FnOnce() -> String + Send> ExternalFunction for LazyPanic<F> {
-    fn invoke(&self, _: &mut core_relations::ExecutionState, args: &[Value]) -> Option<Value> {
+    fn invoke(&self, state: &mut core_relations::ExecutionState, args: &[Value]) -> Option<Value> {
         assert!(args.is_empty());
+        state.trigger_early_stop();
         let mut guard = self.1.lock().unwrap();
         if guard.is_none() {
             *guard = Some(Lazy::force(&self.0).clone());
@@ -1755,7 +1693,7 @@ impl EGraph {
             .entry(message.to_string())
             .or_insert_with(|| {
                 let panic = Panic(message, self.panic_message.clone());
-                self.db.add_external_function(panic)
+                self.db.add_external_function(Box::new(panic))
             })
     }
 
@@ -1765,15 +1703,16 @@ impl EGraph {
     ) -> ExternalFunctionId {
         let lazy = Lazy::new(message);
         let panic = LazyPanic(Arc::new(lazy), self.panic_message.clone());
-        self.db.add_external_function(panic)
+        self.db.add_external_function(Box::new(panic))
     }
 }
 
 impl ExternalFunction for Panic {
-    fn invoke(&self, _: &mut core_relations::ExecutionState, args: &[Value]) -> Option<Value> {
+    fn invoke(&self, state: &mut core_relations::ExecutionState, args: &[Value]) -> Option<Value> {
         // TODO (egglog feature): change this to support interpolating panic messages
         assert!(args.is_empty());
 
+        state.trigger_early_stop();
         let mut guard = self.1.lock().unwrap();
         if guard.is_none() {
             *guard = Some(self.0.clone());
