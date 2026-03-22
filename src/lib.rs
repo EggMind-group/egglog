@@ -57,7 +57,7 @@ use egglog_reports::{ReportLevel, RunReport};
 use extract::{DefaultCost, Extractor, TreeAdditiveCostModel};
 use indexmap::map::Entry;
 use log::{Level, log_enabled};
-use numeric_id::DenseIdMap;
+use numeric_id::{DenseIdMap, NumericId};
 use prelude::*;
 pub use proofs::proof_encoding_helpers::{file_supports_proofs, program_supports_proofs};
 use scheduler::{SchedulerId, SchedulerRecord};
@@ -67,12 +67,14 @@ use std::fmt::{Debug, Display, Formatter};
 use std::fs::File;
 use std::hash::Hash;
 use std::io::{Read, Write as _};
+use std::collections::{BTreeMap, BTreeSet};
 use std::iter::once;
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 pub use termdag::{Term, TermDag, TermId};
+use serde::Serialize;
 use thiserror::Error;
 pub use typechecking::PrimitiveValidator;
 pub use typechecking::TypeError;
@@ -325,6 +327,225 @@ impl Debug for Function {
             .field("schema", &self.schema)
             .finish()
     }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LightSimplifyReport {
+    pub theta: f64,
+    pub root_sort: String,
+    pub root_value: i64,
+    pub before_nodes: usize,
+    pub after_nodes: usize,
+    pub before_classes: usize,
+    pub after_classes: usize,
+    pub threshold_pruned_nodes: usize,
+    pub redundancy_pruned_nodes: usize,
+    pub removed_function_rows: usize,
+}
+
+#[derive(Clone, Debug)]
+struct LightSimplifyNodeInfo {
+    eclass: String,
+    op: String,
+    child_eclasses: Vec<String>,
+    base_cost: f64,
+    removable_function: Option<String>,
+}
+
+fn light_simplify_function_name(node: &SerializedNode) -> Option<String> {
+    match node {
+        SerializedNode::Function { name, .. } => Some(name.clone()),
+        SerializedNode::Split(inner) => light_simplify_function_name(inner),
+        _ => None,
+    }
+}
+
+fn light_compute_tree_costs(
+    infos: &BTreeMap<String, LightSimplifyNodeInfo>,
+    nodes_by_eclass: &BTreeMap<String, Vec<String>>,
+) -> (BTreeMap<String, f64>, BTreeMap<String, f64>, BTreeMap<String, String>) {
+    let inf = f64::INFINITY;
+    let mut class_costs: BTreeMap<String, f64> = nodes_by_eclass
+        .keys()
+        .map(|cid| (cid.clone(), inf))
+        .collect();
+    let mut node_costs: BTreeMap<String, f64> = infos
+        .keys()
+        .map(|nid| (nid.clone(), inf))
+        .collect();
+
+    for _ in 0..std::cmp::max(1, infos.len() + 2) {
+        let mut changed = false;
+        for (node_id, info) in infos {
+            if info
+                .child_eclasses
+                .iter()
+                .any(|cid| !class_costs.get(cid).copied().unwrap_or(inf).is_finite())
+            {
+                continue;
+            }
+            let cost = info.base_cost
+                + info
+                    .child_eclasses
+                    .iter()
+                    .map(|cid| class_costs.get(cid).copied().unwrap_or(inf))
+                    .sum::<f64>();
+            if cost < node_costs.get(node_id).copied().unwrap_or(inf) {
+                node_costs.insert(node_id.clone(), cost);
+                changed = true;
+            }
+            if cost < class_costs.get(&info.eclass).copied().unwrap_or(inf) {
+                class_costs.insert(info.eclass.clone(), cost);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut best_nodes = BTreeMap::new();
+    for (cid, node_ids) in nodes_by_eclass {
+        let mut best: Option<&String> = None;
+        for node_id in node_ids {
+            let cost = node_costs.get(node_id).copied().unwrap_or(inf);
+            if !cost.is_finite() {
+                continue;
+            }
+            match best {
+                None => best = Some(node_id),
+                Some(cur) => {
+                    let cur_cost = node_costs.get(cur).copied().unwrap_or(inf);
+                    if cost < cur_cost || (cost == cur_cost && node_id < cur) {
+                        best = Some(node_id);
+                    }
+                }
+            }
+        }
+        if let Some(node_id) = best {
+            best_nodes.insert(cid.clone(), node_id.clone());
+        }
+    }
+    (class_costs, node_costs, best_nodes)
+}
+
+fn light_best_closure(
+    cid: &str,
+    best_nodes: &BTreeMap<String, String>,
+    infos: &BTreeMap<String, LightSimplifyNodeInfo>,
+    cache: &mut BTreeMap<String, BTreeSet<String>>,
+    active: &mut BTreeSet<String>,
+) -> BTreeSet<String> {
+    if let Some(cached) = cache.get(cid) {
+        return cached.clone();
+    }
+    if active.contains(cid) {
+        return BTreeSet::from([cid.to_string()]);
+    }
+    active.insert(cid.to_string());
+    let mut out = BTreeSet::from([cid.to_string()]);
+    if let Some(best_node_id) = best_nodes.get(cid) {
+        if let Some(info) = infos.get(best_node_id) {
+            for child_cid in &info.child_eclasses {
+                out.extend(light_best_closure(child_cid, best_nodes, infos, cache, active));
+            }
+        }
+    }
+    active.remove(cid);
+    cache.insert(cid.to_string(), out.clone());
+    out
+}
+
+fn light_compute_dag_costs(
+    infos: &BTreeMap<String, LightSimplifyNodeInfo>,
+    nodes_by_eclass: &BTreeMap<String, Vec<String>>,
+) -> (BTreeMap<String, f64>, BTreeMap<String, String>, BTreeMap<String, f64>) {
+    let (_, _, mut best_nodes) = light_compute_tree_costs(infos, nodes_by_eclass);
+    let mut best_base: BTreeMap<String, f64> = best_nodes
+        .iter()
+        .filter_map(|(cid, nid)| infos.get(nid).map(|info| (cid.clone(), info.base_cost)))
+        .collect();
+
+    for _ in 0..2 {
+        let mut closure_cache: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut node_costs = BTreeMap::new();
+
+        for (node_id, info) in infos {
+            let mut seen = BTreeSet::from([info.eclass.clone()]);
+            let mut total = info.base_cost;
+            for child_cid in &info.child_eclasses {
+                let mut active = BTreeSet::new();
+                for closure_cid in
+                    light_best_closure(child_cid, &best_nodes, infos, &mut closure_cache, &mut active)
+                {
+                    if seen.insert(closure_cid.clone()) {
+                        total += best_base.get(&closure_cid).copied().unwrap_or(0.0);
+                    }
+                }
+            }
+            node_costs.insert(node_id.clone(), total);
+        }
+
+        let mut new_best = BTreeMap::new();
+        for (cid, node_ids) in nodes_by_eclass {
+            let mut best: Option<&String> = None;
+            for node_id in node_ids {
+                let cost = node_costs.get(node_id).copied().unwrap_or(f64::INFINITY);
+                if !cost.is_finite() {
+                    continue;
+                }
+                match best {
+                    None => best = Some(node_id),
+                    Some(cur) => {
+                        let cur_cost = node_costs.get(cur).copied().unwrap_or(f64::INFINITY);
+                        if cost < cur_cost || (cost == cur_cost && node_id < cur) {
+                            best = Some(node_id);
+                        }
+                    }
+                }
+            }
+            if let Some(node_id) = best {
+                new_best.insert(cid.clone(), node_id.clone());
+            }
+        }
+
+        if new_best == best_nodes {
+            let class_best_costs = new_best
+                .iter()
+                .filter_map(|(cid, nid)| node_costs.get(nid).copied().map(|cost| (cid.clone(), cost)))
+                .collect();
+            return (node_costs, new_best, class_best_costs);
+        }
+
+        best_nodes = new_best;
+        best_base = best_nodes
+            .iter()
+            .filter_map(|(cid, nid)| infos.get(nid).map(|info| (cid.clone(), info.base_cost)))
+            .collect();
+    }
+
+    let mut closure_cache: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut node_costs = BTreeMap::new();
+    for (node_id, info) in infos {
+        let mut seen = BTreeSet::from([info.eclass.clone()]);
+        let mut total = info.base_cost;
+        for child_cid in &info.child_eclasses {
+            let mut active = BTreeSet::new();
+            for closure_cid in
+                light_best_closure(child_cid, &best_nodes, infos, &mut closure_cache, &mut active)
+            {
+                if seen.insert(closure_cid.clone()) {
+                    total += best_base.get(&closure_cid).copied().unwrap_or(0.0);
+                }
+            }
+        }
+        node_costs.insert(node_id.clone(), total);
+    }
+    let class_best_costs = best_nodes
+        .iter()
+        .filter_map(|(cid, nid)| node_costs.get(nid).copied().map(|cost| (cid.clone(), cost)))
+        .collect();
+    (node_costs, best_nodes, class_best_costs)
 }
 
 impl Default for EGraph {
@@ -1795,6 +2016,217 @@ impl EGraph {
     /// Returns `None` if the function does not exist.
     pub fn get_function(&self, name: &str) -> Option<&Function> {
         self.functions.get(name)
+    }
+
+    /// Evaluate an expression and return the canonical sort/value pair that identifies its e-class.
+    pub fn lookup_expr(&mut self, expr: &Expr) -> Result<(ArcSort, Value), Error> {
+        self.eval_expr(expr)
+    }
+
+    /// Return the flattened rule names contained in a ruleset.
+    pub fn ruleset_rule_names(&self, ruleset: &str) -> Result<Vec<String>, Error> {
+        fn collect(
+            ruleset: &str,
+            rulesets: &IndexMap<String, Ruleset>,
+            out: &mut Vec<String>,
+        ) -> Result<(), Error> {
+            match rulesets.get(ruleset) {
+                Some(Ruleset::Rules(rules)) => {
+                    out.extend(rules.keys().cloned());
+                    Ok(())
+                }
+                Some(Ruleset::Combined(sub_rulesets)) => {
+                    for sub_ruleset in sub_rulesets {
+                        collect(sub_ruleset, rulesets, out)?;
+                    }
+                    Ok(())
+                }
+                None => Err(Error::BackendError(format!("Unknown ruleset: {ruleset}"))),
+            }
+        }
+
+        let mut out = Vec::new();
+        collect(ruleset, &self.rulesets, &mut out)?;
+        Ok(out)
+    }
+
+    /// Run a single named rule from a ruleset.
+    pub fn step_rule(&mut self, ruleset: &str, rule_name: &str) -> Result<RunReport, Error> {
+        fn find_rule_id(
+            ruleset: &str,
+            rule_name: &str,
+            rulesets: &IndexMap<String, Ruleset>,
+        ) -> Result<Option<egglog_bridge::RuleId>, Error> {
+            match rulesets.get(ruleset) {
+                Some(Ruleset::Rules(rules)) => Ok(rules.get(rule_name).map(|(_, id)| *id)),
+                Some(Ruleset::Combined(sub_rulesets)) => {
+                    for sub_ruleset in sub_rulesets {
+                        if let Some(rule_id) = find_rule_id(sub_ruleset, rule_name, rulesets)? {
+                            return Ok(Some(rule_id));
+                        }
+                    }
+                    Ok(None)
+                }
+                None => Err(Error::BackendError(format!("Unknown ruleset: {ruleset}"))),
+            }
+        }
+
+        let Some(rule_id) = find_rule_id(ruleset, rule_name, &self.rulesets)? else {
+            return Err(Error::BackendError(format!(
+                "Unknown rule {rule_name} in ruleset {ruleset}"
+            )));
+        };
+
+        let iteration_report = self
+            .backend
+            .run_rules(&[rule_id])
+            .map_err(|e| Error::BackendError(e.to_string()))?;
+        Ok(RunReport::singleton(ruleset, iteration_report))
+    }
+
+    /// Rooted heuristic simplify that prunes expensive and redundant nodes while keeping the graph live.
+    pub fn light_simplify(&mut self, sort: &ArcSort, value: Value, theta: f64) -> Result<LightSimplifyReport, Error> {
+        if !theta.is_finite() || theta < 1.0 {
+            return Err(Error::BackendError(format!(
+                "light_simplify theta must be finite and >= 1.0, got {theta}"
+            )));
+        }
+
+        let config = SerializeConfig {
+            max_functions: None,
+            max_calls_per_function: None,
+            include_temporary_functions: false,
+            root_eclasses: vec![(sort.clone(), value)],
+        };
+        let before = self.serialize(config).egraph;
+
+        let mut infos: BTreeMap<String, LightSimplifyNodeInfo> = BTreeMap::new();
+        let mut nodes_by_eclass: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (node_id, node) in &before.nodes {
+            let node_id_text = node_id.to_string();
+            let child_eclasses: Vec<String> = node
+                .children
+                .iter()
+                .filter_map(|child_id| before.nodes.get(child_id).map(|child| child.eclass.to_string()))
+                .collect();
+            let removable_function = light_simplify_function_name(&self.from_node_id(node_id));
+            let info = LightSimplifyNodeInfo {
+                eclass: node.eclass.to_string(),
+                op: node.op.clone(),
+                child_eclasses,
+                base_cost: node.cost.into_inner(),
+                removable_function,
+            };
+            nodes_by_eclass
+                .entry(info.eclass.clone())
+                .or_default()
+                .push(node_id_text.clone());
+            infos.insert(node_id_text, info);
+        }
+
+        let (node_costs, best_nodes, class_best_costs) = light_compute_dag_costs(&infos, &nodes_by_eclass);
+
+        let mut redundancy_kept = BTreeSet::new();
+        let mut redundancy_pruned_nodes = 0usize;
+        for node_ids in nodes_by_eclass.values() {
+            let mut best_by_signature: BTreeMap<(String, Vec<String>), String> = BTreeMap::new();
+            for node_id in node_ids {
+                let Some(info) = infos.get(node_id) else {
+                    continue;
+                };
+                let signature = (info.op.clone(), info.child_eclasses.clone());
+                match best_by_signature.get(&signature) {
+                    None => {
+                        best_by_signature.insert(signature, node_id.clone());
+                    }
+                    Some(cur) => {
+                        let cost = node_costs.get(node_id).copied().unwrap_or(f64::INFINITY);
+                        let cur_cost = node_costs.get(cur).copied().unwrap_or(f64::INFINITY);
+                        if cost < cur_cost || (cost == cur_cost && node_id < cur) {
+                            best_by_signature.insert(signature, node_id.clone());
+                        }
+                    }
+                }
+            }
+            redundancy_pruned_nodes += node_ids.len().saturating_sub(best_by_signature.len());
+            redundancy_kept.extend(best_by_signature.into_values());
+        }
+
+        let mut retained = BTreeSet::new();
+        let mut threshold_pruned_nodes = 0usize;
+        for (cid, node_ids) in &nodes_by_eclass {
+            let best_cost = class_best_costs.get(cid).copied().unwrap_or(f64::INFINITY);
+            let limit = best_cost * theta;
+            for node_id in node_ids {
+                if !redundancy_kept.contains(node_id) {
+                    continue;
+                }
+                let cost = node_costs.get(node_id).copied().unwrap_or(f64::INFINITY);
+                if cost <= limit || best_nodes.get(cid) == Some(node_id) {
+                    retained.insert(node_id.clone());
+                } else {
+                    threshold_pruned_nodes += 1;
+                }
+            }
+            if !node_ids.iter().any(|node_id| retained.contains(node_id)) {
+                if let Some(best_node_id) = best_nodes.get(cid) {
+                    retained.insert(best_node_id.clone());
+                }
+            }
+        }
+
+        let mut removed_function_rows = 0usize;
+        for (node_id, info) in &infos {
+            let Some(func_name) = &info.removable_function else {
+                continue;
+            };
+            if retained.contains(node_id) {
+                continue;
+            }
+            let Some(function) = self.functions.get(func_name) else {
+                continue;
+            };
+            let key: Vec<Value> = info
+                .child_eclasses
+                .iter()
+                .map(|cid| self.class_id_to_value(&cid.clone().into()))
+                .collect();
+            let table_action = egglog_bridge::TableAction::new(&self.backend, function.backend_id);
+            self.backend.with_execution_state(|es| {
+                table_action.remove(es, &key);
+            });
+            removed_function_rows += 1;
+        }
+        if removed_function_rows > 0 {
+            self.backend.flush_updates();
+        }
+
+        let after = self
+            .serialize(SerializeConfig {
+                max_functions: None,
+                max_calls_per_function: None,
+                include_temporary_functions: false,
+                root_eclasses: vec![(sort.clone(), value)],
+            })
+            .egraph;
+
+        Ok(LightSimplifyReport {
+            theta,
+            root_sort: sort.name().to_string(),
+            root_value: value.rep() as i64,
+            before_nodes: before.nodes.len(),
+            after_nodes: after.nodes.len(),
+            before_classes: before.class_data.len(),
+            after_classes: after.class_data.len(),
+            threshold_pruned_nodes,
+            redundancy_pruned_nodes,
+            removed_function_rows,
+        })
+    }
+
+    pub fn light_simplify_expr(&mut self, expr: &Expr, theta: f64) -> Result<LightSimplifyReport, Error> {
+        let (sort, value) = self.eval_expr(expr)?;
+        self.light_simplify(&sort, value, theta)
     }
 
     pub fn set_report_level(&mut self, level: ReportLevel) {

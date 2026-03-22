@@ -329,6 +329,37 @@ impl ProofStore {
         buffer
     }
 
+    pub fn rule_trace(&self, proof_id: ProofId) -> Vec<String> {
+        let mut out = Vec::new();
+        self.collect_rule_trace(proof_id, &mut out);
+        out
+    }
+
+    fn collect_rule_trace(&self, proof_id: ProofId, out: &mut Vec<String>) {
+        match &self.get(proof_id).justification {
+            Justification::Fiat => {}
+            Justification::Rule { name, premise_proofs, .. } => {
+                for premise in premise_proofs {
+                    self.collect_rule_trace(*premise, out);
+                }
+                out.push(name.clone());
+            }
+            Justification::MergeFn { old_proof, new_proof, .. } => {
+                self.collect_rule_trace(*old_proof, out);
+                self.collect_rule_trace(*new_proof, out);
+            }
+            Justification::Trans(left, right) => {
+                self.collect_rule_trace(*left, out);
+                self.collect_rule_trace(*right, out);
+            }
+            Justification::Sym(inner) => self.collect_rule_trace(*inner, out),
+            Justification::Congr { proof, child_proof, .. } => {
+                self.collect_rule_trace(*proof, out);
+                self.collect_rule_trace(*child_proof, out);
+            }
+        }
+    }
+
     fn from_raw(
         prog: &Vec<ResolvedNCommand>,
         raw_store: RawProofStore,
