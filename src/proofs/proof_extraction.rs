@@ -1,8 +1,10 @@
 use crate::ast::FunctionSubtype;
 use crate::extract::{Extractor, TreeAdditiveCostModel};
 use crate::proofs::proof_encoding::ProofInstrumentor;
-use crate::proofs::proof_format::{Justification, ProofId, ProofStore, proof_store_from_term};
-use crate::{ResolvedCall, TermDag};
+use crate::proofs::proof_format::{
+    Justification, ProofId, ProofStore, proof_store_from_term, raw_rule_trace_from_term,
+};
+use crate::{ResolvedCall, TermDag, TermId};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -16,12 +18,10 @@ pub enum ProveExistsError {
 }
 
 impl ProofInstrumentor<'_> {
-    /// Prove the existence of a constructor or fail if a proof cannot be found.
-    /// We use a constructor because inserting a value at the top level would give a trivial proof.
-    pub(crate) fn prove_exists(
+    fn resolve_existence_proof_inputs(
         &mut self,
         call: &ResolvedCall,
-    ) -> Result<(ProofStore, ProofId), ProveExistsError> {
+    ) -> Result<(String, TermDag, TermId, String), ProveExistsError> {
         let func = match call {
             ResolvedCall::Func(func) if func.subtype == FunctionSubtype::Constructor => func,
             ResolvedCall::Func(_) => {
@@ -41,8 +41,6 @@ impl ProofInstrumentor<'_> {
         let backend_id = function.backend_id;
         let output_sort = function.schema.output.clone();
 
-        // Use the version that ignores unextractable flag since proof extraction
-        // needs to extract proofs from all terms including those marked unextractable
         let extractor = Extractor::compute_costs_from_rootsorts_allow_unextractable(
             None,
             self.egraph,
@@ -103,6 +101,18 @@ impl ProofInstrumentor<'_> {
                 panic!("failed to extract proof term for constructor {}", func.name)
             });
 
+        Ok((func.name.clone(), termdag, proof_term_id, proof_function_name))
+    }
+
+    /// Prove the existence of a constructor or fail if a proof cannot be found.
+    /// We use a constructor because inserting a value at the top level would give a trivial proof.
+    pub(crate) fn prove_exists(
+        &mut self,
+        call: &ResolvedCall,
+    ) -> Result<(ProofStore, ProofId), ProveExistsError> {
+        let (_constructor, termdag, proof_term_id, _proof_function_name) =
+            self.resolve_existence_proof_inputs(call)?;
+
         let (mut proof_store, proof_id) = proof_store_from_term(
             &self.egraph.proof_state.proof_names,
             termdag,
@@ -141,5 +151,18 @@ impl ProofInstrumentor<'_> {
             .expect("simplified existence proof should still be valid");
 
         Ok((proof_store, extra_rule_removed))
+    }
+
+    pub(crate) fn prove_exists_rule_trace(
+        &mut self,
+        call: &ResolvedCall,
+    ) -> Result<Vec<String>, ProveExistsError> {
+        let (_constructor, termdag, proof_term_id, _proof_function_name) =
+            self.resolve_existence_proof_inputs(call)?;
+        Ok(raw_rule_trace_from_term(
+            &self.egraph.proof_state.proof_names,
+            termdag,
+            proof_term_id,
+        ))
     }
 }

@@ -21,6 +21,7 @@ mod core;
 pub mod extract;
 pub mod prelude;
 mod proofs;
+pub mod rewrite_trace;
 
 pub mod scheduler;
 mod serialize;
@@ -134,6 +135,8 @@ pub enum CommandOutput {
         proof_store: ProofStore,
         proof_id: ProofId,
     },
+    /// A lightweight trace of user rule names extracted from a proof witness.
+    ProveExistsRuleTrace(Vec<String>),
     /// The report from all runs
     OverallStatistics(RunReport),
     /// A printed function and all its values
@@ -179,6 +182,9 @@ impl std::fmt::Display for CommandOutput {
                 proof_store,
                 proof_id,
             } => writeln!(f, "{}", proof_store.proof_to_string(*proof_id)),
+            CommandOutput::ProveExistsRuleTrace(rule_trace) => {
+                writeln!(f, "{}", rule_trace.join("\n"))
+            }
             CommandOutput::OverallStatistics(run_report) => {
                 write!(f, "Overall statistics:\n{run_report}")
             }
@@ -686,6 +692,11 @@ impl EGraph {
     pub(crate) fn with_proofs_enabled(mut self) -> Self {
         self = self.with_term_encoding_enabled();
         self.proof_state.proofs_enabled = true;
+        self
+    }
+
+    pub(crate) fn with_proof_rule_trace_only(mut self) -> Self {
+        self.proof_state.proof_rule_trace_only = true;
         self
     }
 
@@ -1576,18 +1587,30 @@ impl EGraph {
                 return res;
             }
             ResolvedNCommand::ProveExists(span, resolved_call) => {
+                let proof_rule_trace_only = self.proof_state.proof_rule_trace_only;
                 let mut instrument = ProofInstrumentor { egraph: self };
-                let (proof_store, proof_id) =
-                    instrument
-                        .prove_exists(&resolved_call)
-                        .map_err(|error| Error::ProofError {
-                            span: span.clone(),
-                            error,
-                        })?;
-                return Ok(Some(CommandOutput::ProveExists {
-                    proof_store,
-                    proof_id,
-                }));
+                if proof_rule_trace_only {
+                    let rule_trace =
+                        instrument
+                            .prove_exists_rule_trace(&resolved_call)
+                            .map_err(|error| Error::ProofError {
+                                span: span.clone(),
+                                error,
+                            })?;
+                    return Ok(Some(CommandOutput::ProveExistsRuleTrace(rule_trace)));
+                } else {
+                    let (proof_store, proof_id) =
+                        instrument
+                            .prove_exists(&resolved_call)
+                            .map_err(|error| Error::ProofError {
+                                span: span.clone(),
+                                error,
+                            })?;
+                    return Ok(Some(CommandOutput::ProveExists {
+                        proof_store,
+                        proof_id,
+                    }));
+                }
             }
         };
 

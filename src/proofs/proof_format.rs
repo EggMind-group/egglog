@@ -42,6 +42,16 @@ pub(crate) fn proof_store_from_term(
     ProofStore::from_raw(prog, raw_store, raw_proof_id)
 }
 
+pub(crate) fn raw_rule_trace_from_term(
+    encoding_names: &EncodingNames,
+    term_dag: TermDag,
+    proof_term: TermId,
+) -> Vec<String> {
+    let (raw_store, raw_proof_id) =
+        RawProofStore::from_extracted(encoding_names, term_dag, proof_term);
+    raw_store.rule_trace(raw_proof_id)
+}
+
 /// Justifies a single grounded equality t1 = t2.
 /// Corresponds closely to the proof header in [`proof_encoding_helpers.rs`](crate::proofs::proof_encoding_helpers).
 /// Compared to [`Proof`], a [`RawProof`] leaves out the implicit [`Proposition`] being proven (in some cases) and
@@ -307,6 +317,44 @@ impl RawProofStore {
             args.len()
         );
         args[0]
+    }
+
+    fn rule_trace(&self, raw_proof_id: RawProofId) -> Vec<String> {
+        let mut out = Vec::new();
+        let root = match &self.store[raw_proof_id.index()] {
+            RawProof::Rule(_, premise_proofs, _, _) => match premise_proofs.as_slice() {
+                [premise] => *premise,
+                _ => raw_proof_id,
+            },
+            _ => raw_proof_id,
+        };
+        self.collect_rule_trace(root, &mut out);
+        out
+    }
+
+    fn collect_rule_trace(&self, raw_proof_id: RawProofId, out: &mut Vec<String>) {
+        match &self.store[raw_proof_id.index()] {
+            RawProof::Fiat(..) => {}
+            RawProof::Rule(name, premises, _, _) => {
+                for premise in premises {
+                    self.collect_rule_trace(*premise, out);
+                }
+                out.push(name.clone());
+            }
+            RawProof::MergeFn(_, old_proof, new_proof, _) => {
+                self.collect_rule_trace(*old_proof, out);
+                self.collect_rule_trace(*new_proof, out);
+            }
+            RawProof::Trans(left, right) => {
+                self.collect_rule_trace(*left, out);
+                self.collect_rule_trace(*right, out);
+            }
+            RawProof::Sym(inner) => self.collect_rule_trace(*inner, out),
+            RawProof::Congr(proof, _, child_proof) => {
+                self.collect_rule_trace(*proof, out);
+                self.collect_rule_trace(*child_proof, out);
+            }
+        }
     }
 }
 

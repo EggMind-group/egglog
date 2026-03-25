@@ -1,4 +1,5 @@
 use crate::*;
+use crate::rewrite_trace::{RewriteTraceConfig, run_rewrite_trace_from_path};
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 
 use clap::Parser;
@@ -61,6 +62,18 @@ struct Args {
     /// Enable proof testing, turning all `check` statements into `prove` statements
     #[clap(long)]
     proof_testing: bool,
+    /// Emit a per-round rewrite trace as JSON instead of running the input program normally
+    #[clap(long)]
+    rewrite_trace: bool,
+    /// Number of rounds to run in rewrite-trace mode
+    #[clap(long)]
+    rewrite_trace_rounds: Option<usize>,
+    /// Number of iterations per round in rewrite-trace mode
+    #[clap(long)]
+    rewrite_trace_iters: Option<usize>,
+    /// Ruleset to run in rewrite-trace mode. Defaults to the first simple run schedule or `all`
+    #[clap(long)]
+    rewrite_trace_ruleset: Option<String>,
 }
 
 /// Start a command-line interface for the E-graph.
@@ -88,6 +101,47 @@ pub fn cli(mut egraph: EGraph) {
     if args.proof_testing {
         egraph = egraph.with_proofs_enabled();
         egraph = egraph.with_proof_testing();
+    }
+
+    if args.rewrite_trace
+        || args.rewrite_trace_rounds.is_some()
+        || args.rewrite_trace_iters.is_some()
+    {
+        if args.inputs.len() != 1 {
+            eprintln!("rewrite trace mode requires exactly one input .egg file");
+            std::process::exit(2);
+        }
+        let Some(max_rounds) = args.rewrite_trace_rounds else {
+            eprintln!("rewrite trace mode requires --rewrite-trace-rounds");
+            std::process::exit(2);
+        };
+        let Some(round_iters) = args.rewrite_trace_iters else {
+            eprintln!("rewrite trace mode requires --rewrite-trace-iters");
+            std::process::exit(2);
+        };
+        let config = RewriteTraceConfig {
+            round_iters,
+            max_rounds,
+            ruleset: args.rewrite_trace_ruleset.clone(),
+            with_proofs: args.proofs,
+            strict_mode: args.strict_mode,
+            seminaive: !args.naive,
+            report_level: args.report_level,
+            fact_directory: args.fact_directory.clone(),
+            term_encoding: args.term_encoding,
+        };
+        match run_rewrite_trace_from_path(&args.inputs[0], &config) {
+            Ok(report) => {
+                serde_json::to_writer_pretty(io::stdout(), &report)
+                    .expect("failed to write rewrite trace json");
+                println!();
+                std::process::exit(0);
+            }
+            Err(err) => {
+                eprintln!("{err}");
+                std::process::exit(1);
+            }
+        }
     }
 
     rayon::ThreadPoolBuilder::new()
