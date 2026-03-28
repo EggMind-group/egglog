@@ -1,12 +1,12 @@
 use crate::{
-    ResolvedCall, Term, TermDag, TermId,
     ast::{FunctionSubtype, ResolvedExpr, ResolvedFact, ResolvedNCommand},
     proofs::{proof_checker::gather_globals, proof_encoding_helpers::EncodingNames},
     typechecking::FuncType,
     util::{HEntry, HashMap, IndexSet, SymbolGen},
+    ResolvedCall, Term, TermDag, TermId,
 };
 use egglog_ast::generic_ast::Literal;
-use egglog_numeric_id::{DenseIdMap, NumericId, define_id};
+use egglog_numeric_id::{define_id, DenseIdMap, NumericId};
 use std::fmt;
 
 define_id!(
@@ -75,6 +75,18 @@ pub struct ProofStore {
     pub(super) term_dag: TermDag,
     proof_id: HashMap<RawProof, ProofId>,
     pub(super) id_to_proof: DenseIdMap<ProofId, Proof>,
+}
+
+/// A localized rule-chain recovered from one proof region.
+///
+/// The `path` is the sequence of `child_index` values encountered while
+/// descending through congruence steps from the proof root to the region.
+/// An empty path refers to the top-level region.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProofRegionRuleChain {
+    pub path: Vec<usize>,
+    pub rule_trace: Vec<String>,
+    pub compressed_rule_trace: Vec<String>,
 }
 
 /// In egglog, all proofs prove a [`Proposition`], which is an equality between two terms.
@@ -335,16 +347,52 @@ impl ProofStore {
         out
     }
 
+    /// Return rule chains grouped by localized proof region.
+    ///
+    /// Regions are keyed by the nested sequence of `Congr.child_index`
+    /// traversals needed to reach a proof subtree. This preserves a notion of
+    /// "same part" that is lost in the flat `rule_trace()` output.
+    pub fn region_rule_chains(&self, proof_id: ProofId) -> Vec<ProofRegionRuleChain> {
+        let mut events: Vec<(Vec<usize>, String)> = Vec::new();
+        let mut current_path = Vec::new();
+        self.collect_region_rule_events(proof_id, &mut current_path, &mut events);
+
+        let mut grouped: Vec<ProofRegionRuleChain> = Vec::new();
+        for (path, rule_name) in events {
+            if let Some(existing) = grouped.iter_mut().find(|item| item.path == path) {
+                existing.rule_trace.push(rule_name);
+                continue;
+            }
+            grouped.push(ProofRegionRuleChain {
+                path,
+                rule_trace: vec![rule_name],
+                compressed_rule_trace: Vec::new(),
+            });
+        }
+        for item in &mut grouped {
+            item.compressed_rule_trace = compress_rule_trace(&item.rule_trace);
+        }
+        grouped
+    }
+
     fn collect_rule_trace(&self, proof_id: ProofId, out: &mut Vec<String>) {
         match &self.get(proof_id).justification {
             Justification::Fiat => {}
-            Justification::Rule { name, premise_proofs, .. } => {
+            Justification::Rule {
+                name,
+                premise_proofs,
+                ..
+            } => {
                 for premise in premise_proofs {
                     self.collect_rule_trace(*premise, out);
                 }
                 out.push(name.clone());
             }
-            Justification::MergeFn { old_proof, new_proof, .. } => {
+            Justification::MergeFn {
+                old_proof,
+                new_proof,
+                ..
+            } => {
                 self.collect_rule_trace(*old_proof, out);
                 self.collect_rule_trace(*new_proof, out);
             }
@@ -353,9 +401,55 @@ impl ProofStore {
                 self.collect_rule_trace(*right, out);
             }
             Justification::Sym(inner) => self.collect_rule_trace(*inner, out),
-            Justification::Congr { proof, child_proof, .. } => {
+            Justification::Congr {
+                proof, child_proof, ..
+            } => {
                 self.collect_rule_trace(*proof, out);
                 self.collect_rule_trace(*child_proof, out);
+            }
+        }
+    }
+
+    fn collect_region_rule_events(
+        &self,
+        proof_id: ProofId,
+        current_path: &mut Vec<usize>,
+        out: &mut Vec<(Vec<usize>, String)>,
+    ) {
+        match &self.get(proof_id).justification {
+            Justification::Fiat => {}
+            Justification::Rule {
+                name,
+                premise_proofs,
+                ..
+            } => {
+                for premise in premise_proofs {
+                    self.collect_region_rule_events(*premise, current_path, out);
+                }
+                out.push((current_path.clone(), name.clone()));
+            }
+            Justification::MergeFn {
+                old_proof,
+                new_proof,
+                ..
+            } => {
+                self.collect_region_rule_events(*old_proof, current_path, out);
+                self.collect_region_rule_events(*new_proof, current_path, out);
+            }
+            Justification::Trans(left, right) => {
+                self.collect_region_rule_events(*left, current_path, out);
+                self.collect_region_rule_events(*right, current_path, out);
+            }
+            Justification::Sym(inner) => self.collect_region_rule_events(*inner, current_path, out),
+            Justification::Congr {
+                proof,
+                child_index,
+                child_proof,
+            } => {
+                self.collect_region_rule_events(*proof, current_path, out);
+                current_path.push(*child_index);
+                self.collect_region_rule_events(*child_proof, current_path, out);
+                current_path.pop();
             }
         }
     }
@@ -786,6 +880,34 @@ impl ProofStore {
     }
 }
 
+fn compress_rule_trace(rule_trace: &[String]) -> Vec<String> {
+    if rule_trace.is_empty() {
+        return Vec::new();
+    }
+    let mut compressed: Vec<String> = Vec::new();
+    let mut current = rule_trace[0].clone();
+    let mut count = 1usize;
+    for rule_name in &rule_trace[1..] {
+        if *rule_name == current {
+            count += 1;
+            continue;
+        }
+        compressed.push(if count > 1 {
+            format!("{current} x{count}")
+        } else {
+            current.clone()
+        });
+        current = rule_name.clone();
+        count = 1;
+    }
+    compressed.push(if count > 1 {
+        format!("{current} x{count}")
+    } else {
+        current
+    });
+    compressed
+}
+
 impl Proof {
     /// Get the proposition the proof proves
     pub fn proposition(&self) -> &Proposition {
@@ -804,5 +926,107 @@ impl Proof {
     /// Get the justification for the proof
     pub fn justification(&self) -> &Justification {
         &self.justification
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egglog_ast::generic_ast::Literal;
+
+    fn empty_subst() -> HashMap<String, TermId> {
+        HashMap::default()
+    }
+
+    #[test]
+    fn region_rule_chains_group_rules_by_congruence_path() {
+        let mut term_dag = TermDag::default();
+        let t0 = term_dag.lit(Literal::Int(0));
+        let t1 = term_dag.lit(Literal::Int(1));
+        let t2 = term_dag.lit(Literal::Int(2));
+        let t3 = term_dag.lit(Literal::Int(3));
+        let t4 = term_dag.lit(Literal::Int(4));
+
+        let mut store = ProofStore {
+            term_dag,
+            proof_id: HashMap::default(),
+            id_to_proof: DenseIdMap::new(),
+        };
+
+        let root_rule = store.id_to_proof.push(Proof {
+            proposition: Proposition::new(t0, t1),
+            justification: Justification::Rule {
+                name: "root_rule".to_string(),
+                premise_proofs: vec![],
+                substitution: empty_subst(),
+            },
+        });
+        let child_rule = store.id_to_proof.push(Proof {
+            proposition: Proposition::new(t1, t2),
+            justification: Justification::Rule {
+                name: "child_rule".to_string(),
+                premise_proofs: vec![],
+                substitution: empty_subst(),
+            },
+        });
+        let deep_rule = store.id_to_proof.push(Proof {
+            proposition: Proposition::new(t2, t3),
+            justification: Justification::Rule {
+                name: "deep_rule".to_string(),
+                premise_proofs: vec![],
+                substitution: empty_subst(),
+            },
+        });
+        let repeated_deep_rule = store.id_to_proof.push(Proof {
+            proposition: Proposition::new(t3, t4),
+            justification: Justification::Rule {
+                name: "deep_rule".to_string(),
+                premise_proofs: vec![],
+                substitution: empty_subst(),
+            },
+        });
+        let deep_congr = store.id_to_proof.push(Proof {
+            proposition: Proposition::new(t1, t3),
+            justification: Justification::Congr {
+                proof: child_rule,
+                child_index: 0,
+                child_proof: deep_rule,
+            },
+        });
+        let deep_congr_2 = store.id_to_proof.push(Proof {
+            proposition: Proposition::new(t1, t4),
+            justification: Justification::Congr {
+                proof: deep_congr,
+                child_index: 0,
+                child_proof: repeated_deep_rule,
+            },
+        });
+        let top = store.id_to_proof.push(Proof {
+            proposition: Proposition::new(t0, t4),
+            justification: Justification::Congr {
+                proof: root_rule,
+                child_index: 1,
+                child_proof: deep_congr_2,
+            },
+        });
+
+        let chains = store.region_rule_chains(top);
+        assert_eq!(chains.len(), 3);
+
+        assert_eq!(chains[0].path, Vec::<usize>::new());
+        assert_eq!(chains[0].rule_trace, vec!["root_rule".to_string()]);
+
+        assert_eq!(chains[1].path, vec![1]);
+        assert_eq!(chains[1].rule_trace, vec!["child_rule".to_string()]);
+
+        assert_eq!(chains[2].path, vec![1, 0]);
+        assert_eq!(
+            chains[2].rule_trace,
+            vec!["deep_rule".to_string(), "deep_rule".to_string()]
+        );
+        assert_eq!(
+            chains[2].compressed_rule_trace,
+            vec!["deep_rule x2".to_string()]
+        );
     }
 }
