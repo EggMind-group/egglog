@@ -158,6 +158,59 @@ struct ExtractionOptions<C: Cost> {
 }
 
 impl<C: Cost + Ord + Eq + Clone + Debug> Extractor<C> {
+    fn root_variants_with_sort(
+        &self,
+        egraph: &EGraph,
+        value: Value,
+        nvariants: usize,
+        sort: ArcSort,
+    ) -> Vec<(C, String, Vec<Value>)> {
+        debug_assert!(self.rootsorts.iter().any(|s| { s.name() == sort.name() }));
+
+        if !sort.is_eq_sort() {
+            return vec![];
+        }
+
+        let canonical_value = self.find_canonical(egraph, value, &sort);
+
+        let mut root_variants: Vec<(C, String, Vec<Value>)> = Vec::new();
+
+        let mut root_funcs: Vec<String> = Vec::new();
+        for func_name in self.funcs.iter() {
+            if sort.name()
+                == egraph
+                    .functions
+                    .get(func_name)
+                    .unwrap()
+                    .extraction_output_sort()
+                    .name()
+            {
+                root_funcs.push(func_name.clone());
+            }
+        }
+
+        for func_name in root_funcs.iter() {
+            let func = egraph.functions.get(func_name).unwrap();
+            let output_idx = func.extraction_output_index();
+
+            let find_root_variants = |row: egglog_bridge::FunctionRow| {
+                if !row.subsumed {
+                    let target = &row.vals[output_idx];
+                    if *target == canonical_value {
+                        let cost = self.compute_cost_hyperedge(egraph, &row, func).unwrap();
+                        root_variants.push((cost, func_name.clone(), row.vals.to_vec()));
+                    }
+                }
+            };
+
+            egraph.backend.for_each(func.backend_id, find_root_variants);
+        }
+
+        root_variants.sort();
+        root_variants.truncate(nvariants);
+        root_variants
+    }
+
     /// Bulk of the computation happens at initialization time.
     /// The later extractions only reuses saved results.
     /// This means a new extractor must be created if the egraph changes.
@@ -512,7 +565,7 @@ impl<C: Cost + Ord + Eq + Clone + Debug> Extractor<C> {
         self.reconstruct_termdag_node_helper(egraph, termdag, value, sort, &mut Default::default())
     }
 
-    fn reconstruct_termdag_node_helper(
+    pub(crate) fn reconstruct_termdag_node_helper(
         &self,
         egraph: &EGraph,
         termdag: &mut TermDag,
@@ -661,49 +714,11 @@ impl<C: Cost + Ord + Eq + Clone + Debug> Extractor<C> {
         debug_assert!(self.rootsorts.iter().any(|s| { s.name() == sort.name() }));
 
         if sort.is_eq_sort() {
-            // Canonicalize the value using the union-find if available
-            let canonical_value = self.find_canonical(egraph, value, &sort);
-
-            let mut root_variants: Vec<(C, String, Vec<Value>)> = Vec::new();
-
-            let mut root_funcs: Vec<String> = Vec::new();
-
-            for func_name in self.funcs.iter() {
-                // Need an eq on sorts - use extraction_output_sort for view table support
-                if sort.name()
-                    == egraph
-                        .functions
-                        .get(func_name)
-                        .unwrap()
-                        .extraction_output_sort()
-                        .name()
-                {
-                    root_funcs.push(func_name.clone());
-                }
-            }
-
-            for func_name in root_funcs.iter() {
-                let func = egraph.functions.get(func_name).unwrap();
-                let output_idx = func.extraction_output_index();
-
-                let find_root_variants = |row: egglog_bridge::FunctionRow| {
-                    if !row.subsumed {
-                        let target = &row.vals[output_idx];
-                        if *target == canonical_value {
-                            let cost = self.compute_cost_hyperedge(egraph, &row, func).unwrap();
-                            root_variants.push((cost, func_name.clone(), row.vals.to_vec()));
-                        }
-                    }
-                };
-
-                egraph.backend.for_each(func.backend_id, find_root_variants);
-            }
-
             let mut res: Vec<(C, TermId)> = Vec::new();
             let mut cache: HashMap<(Value, String), TermId> = Default::default();
-            root_variants.sort();
-            root_variants.truncate(nvariants);
-            for (cost, func_name, hyperedge) in root_variants {
+            for (cost, func_name, hyperedge) in
+                self.root_variants_with_sort(egraph, value, nvariants, sort.clone())
+            {
                 let mut ch_terms: Vec<TermId> = Vec::new();
                 let func = egraph.functions.get(&func_name).unwrap();
                 let ch_sorts = &func.schema.input;
@@ -756,6 +771,113 @@ impl<C: Cost + Ord + Eq + Clone + Debug> Extractor<C> {
             self.rootsorts.first().unwrap().clone(),
         )
     }
+}
+
+impl Extractor<DefaultCost> {
+    pub(crate) fn extract_anchor_variants_with_sort(
+        &self,
+        egraph: &EGraph,
+        value: Value,
+        nvariants: usize,
+        sort: ArcSort,
+    ) -> Vec<(DefaultCost, String, Vec<Value>)> {
+        self.root_variants_with_sort(egraph, value, nvariants, sort)
+    }
+
+    pub(crate) fn collect_best_tree_anchor_entries(
+        &self,
+        egraph: &EGraph,
+        value: Value,
+        sort: &ArcSort,
+        out: &mut HashMap<String, HashMap<Value, DefaultCost>>,
+    ) {
+        if sort.is_container_sort() {
+            for (inner_sort, inner_value) in
+                sort.inner_values(egraph.backend.container_values(), value)
+            {
+                self.collect_best_tree_anchor_entries(egraph, inner_value, &inner_sort, out);
+            }
+            return;
+        }
+        if !sort.is_eq_sort() {
+            return;
+        }
+
+        let canonical = self.find_canonical(egraph, value, sort);
+        let Some(best_cost) = self
+            .costs
+            .get(sort.name())
+            .and_then(|costs| costs.get(&canonical))
+            .copied()
+        else {
+            return;
+        };
+        let seen = out.entry(sort.name().to_owned()).or_default();
+        if seen.insert(canonical, best_cost).is_some() {
+            return;
+        }
+
+        let Some((func_name, row_vals)) = self
+            .parent_edge
+            .get(sort.name())
+            .and_then(|by_value| by_value.get(&canonical))
+        else {
+            return;
+        };
+        let func = egraph.functions.get(func_name).unwrap();
+        let num_children = func.extraction_num_children();
+        for (child_value, child_sort) in row_vals
+            .iter()
+            .take(num_children)
+            .zip(func.schema.input.iter())
+        {
+            self.collect_best_tree_anchor_entries(egraph, *child_value, child_sort, out);
+        }
+    }
+
+    pub(crate) fn collect_best_tree_anchor_rows(
+        &self,
+        egraph: &EGraph,
+        value: Value,
+        sort: &ArcSort,
+        out: &mut HashSet<(String, Vec<Value>)>,
+    ) {
+        if sort.is_container_sort() {
+            for (inner_sort, inner_value) in
+                sort.inner_values(egraph.backend.container_values(), value)
+            {
+                self.collect_best_tree_anchor_rows(egraph, inner_value, &inner_sort, out);
+            }
+            return;
+        }
+        if !sort.is_eq_sort() {
+            return;
+        }
+
+        let canonical = self.find_canonical(egraph, value, sort);
+        let Some((func_name, row_vals)) = self
+            .parent_edge
+            .get(sort.name())
+            .and_then(|by_value| by_value.get(&canonical))
+        else {
+            return;
+        };
+        let func = egraph.functions.get(func_name).unwrap();
+        let key = row_vals[..func.schema.input.len()].to_vec();
+        if !out.insert((func_name.clone(), key)) {
+            return;
+        }
+
+        let num_children = func.extraction_num_children();
+        for (child_value, child_sort) in row_vals
+            .iter()
+            .take(num_children)
+            .zip(func.schema.input.iter())
+        {
+            self.collect_best_tree_anchor_rows(egraph, *child_value, child_sort, out);
+        }
+    }
+
 }
 
 impl Function {

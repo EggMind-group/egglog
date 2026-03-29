@@ -61,10 +61,9 @@ use numeric_id::{DenseIdMap, NumericId};
 use prelude::*;
 pub use proofs::proof_encoding_helpers::{file_supports_proofs, program_supports_proofs};
 use scheduler::{SchedulerId, SchedulerRecord};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 pub use serialize::{SerializeConfig, SerializeOutput, SerializedNode};
 use sort::*;
-use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Debug, Display, Formatter};
 use std::fs::File;
 use std::hash::Hash;
@@ -74,6 +73,7 @@ use std::ops::Deref;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Instant;
 pub use termdag::{Term, TermDag, TermId};
 use thiserror::Error;
 pub use typechecking::PrimitiveValidator;
@@ -343,91 +343,102 @@ pub struct LightSimplifyReport {
     pub removed_function_rows: usize,
 }
 
-#[derive(Clone, Debug)]
-struct LightSimplifyNodeInfo {
-    eclass: String,
-    child_eclasses: Vec<String>,
-    base_cost: f64,
-    removable_function: Option<String>,
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LightSimplifyAnchorEntry {
+    pub sort: String,
+    pub value: i64,
+    pub best_cost: u64,
 }
 
-fn light_simplify_function_name(node: &SerializedNode) -> Option<String> {
-    match node {
-        SerializedNode::Function { name, .. } => Some(name.clone()),
-        SerializedNode::Split(inner) => light_simplify_function_name(inner),
-        _ => None,
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LightSimplifyPinnedRow {
+    pub func: String,
+    pub key: Vec<i64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LightSimplifyAnchor {
+    pub term: String,
+    pub cost: u64,
+    pub root_sort: String,
+    pub root_value: i64,
+    pub entries: Vec<LightSimplifyAnchorEntry>,
+    pub pinned_rows: Vec<LightSimplifyPinnedRow>,
+}
+
+const LIGHT_SIMPLIFY_NUM_ANCHORS: usize = 3;
+
+fn light_anchor_value_cost(
+    egraph: &EGraph,
+    sort: &ArcSort,
+    value: Value,
+    best_costs: &HashMap<String, HashMap<Value, DefaultCost>>,
+) -> Option<DefaultCost> {
+    if sort.is_container_sort() {
+        let mut total: DefaultCost = 0;
+        for (inner_sort, inner_value) in sort.inner_values(egraph.backend.container_values(), value) {
+            total = total.saturating_add(light_anchor_value_cost(
+                egraph,
+                &inner_sort,
+                inner_value,
+                best_costs,
+            )?);
+        }
+        Some(total)
+    } else if sort.is_eq_sort() {
+        let canonical = egraph.get_canonical_value(value, sort);
+        best_costs
+            .get(sort.name())
+            .and_then(|by_value| by_value.get(&canonical))
+            .copied()
+    } else {
+        Some(1)
     }
 }
 
-fn light_compute_tree_costs(
-    infos: &BTreeMap<String, LightSimplifyNodeInfo>,
-    nodes_by_eclass: &BTreeMap<String, Vec<String>>,
-) -> (
-    BTreeMap<String, f64>,
-    BTreeMap<String, f64>,
-    BTreeMap<String, String>,
-) {
-    let inf = f64::INFINITY;
-    let mut class_costs: BTreeMap<String, f64> = nodes_by_eclass
-        .keys()
-        .map(|cid| (cid.clone(), inf))
-        .collect();
-    let mut node_costs: BTreeMap<String, f64> =
-        infos.keys().map(|nid| (nid.clone(), inf)).collect();
-
-    for _ in 0..std::cmp::max(1, infos.len() + 2) {
-        let mut changed = false;
-        for (node_id, info) in infos {
-            if info
-                .child_eclasses
-                .iter()
-                .any(|cid| !class_costs.get(cid).copied().unwrap_or(inf).is_finite())
-            {
-                continue;
-            }
-            let cost = info.base_cost
-                + info
-                    .child_eclasses
-                    .iter()
-                    .map(|cid| class_costs.get(cid).copied().unwrap_or(inf))
-                    .sum::<f64>();
-            if cost < node_costs.get(node_id).copied().unwrap_or(inf) {
-                node_costs.insert(node_id.clone(), cost);
-                changed = true;
-            }
-            if cost < class_costs.get(&info.eclass).copied().unwrap_or(inf) {
-                class_costs.insert(info.eclass.clone(), cost);
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
+fn light_anchor_row_cost(
+    egraph: &EGraph,
+    func: &Function,
+    row: &egglog_bridge::FunctionRow,
+    best_costs: &HashMap<String, HashMap<Value, DefaultCost>>,
+) -> Option<DefaultCost> {
+    let mut total = func.decl.cost.unwrap_or(1);
+    let num_children = func.extraction_num_children();
+    for (child_value, child_sort) in row
+        .vals
+        .iter()
+        .take(num_children)
+        .zip(func.schema.input.iter())
+    {
+        total = total.saturating_add(light_anchor_value_cost(
+            egraph,
+            child_sort,
+            *child_value,
+            best_costs,
+        )?);
     }
+    Some(total)
+}
 
-    let mut best_nodes = BTreeMap::new();
-    for (cid, node_ids) in nodes_by_eclass {
-        let mut best: Option<&String> = None;
-        for node_id in node_ids {
-            let cost = node_costs.get(node_id).copied().unwrap_or(inf);
-            if !cost.is_finite() {
-                continue;
-            }
-            match best {
-                None => best = Some(node_id),
-                Some(cur) => {
-                    let cur_cost = node_costs.get(cur).copied().unwrap_or(inf);
-                    if cost < cur_cost || (cost == cur_cost && node_id < cur) {
-                        best = Some(node_id);
+fn light_anchor_cost_map(
+    anchors: &[LightSimplifyAnchor],
+) -> HashMap<String, HashMap<Value, DefaultCost>> {
+    let mut best_costs: HashMap<String, HashMap<Value, DefaultCost>> = Default::default();
+    for anchor in anchors {
+        for entry in &anchor.entries {
+            let by_value = best_costs.entry(entry.sort.clone()).or_default();
+            let value = Value::from_usize(entry.value as usize);
+            by_value
+                .entry(value)
+                .and_modify(|current| {
+                    if entry.best_cost > *current {
+                        *current = entry.best_cost;
                     }
-                }
-            }
-        }
-        if let Some(node_id) = best {
-            best_nodes.insert(cid.clone(), node_id.clone());
+                })
+                .or_insert(entry.best_cost);
         }
     }
-    (class_costs, node_costs, best_nodes)
+    best_costs
 }
 
 impl Default for EGraph {
@@ -1968,133 +1979,382 @@ impl EGraph {
 
     /// Rooted threshold simplify.
     ///
-    /// The pass serializes the root-reachable graph, computes per-node tree costs,
-    /// finds the best cost in each eclass, and retains:
-    /// - the best node for each eclass
-    /// - any node whose tree cost is within `best_cost * theta`
+    /// This pass is intentionally lighter than `extract + reset`, but also
+    /// lighter than a full graph-wide rooted prune. It:
+    /// - computes the best extraction tree from the root
+    /// - collects the eclasses that occur on that best tree
+    /// - scans reachable constructor rows and only considers rows producing one
+    ///   of those best-tree eclasses
+    /// - retains rows whose global tree cost is within `best_cost * theta`
     ///
-    /// It intentionally does not do global DAG-closure propagation, redundancy
-    /// dedup, or any other cross-eclass fixpoint analysis.
+    /// This preserves a theta-controlled neighborhood around the current best
+    /// root-local solution without collapsing the graph to a single tree.
+    pub fn extract_light_simplify_anchor(
+        &self,
+        sort: &ArcSort,
+        value: Value,
+    ) -> Result<LightSimplifyAnchor, Error> {
+        let mut anchors = self.extract_light_simplify_anchors(sort, value, 1)?;
+        anchors.pop().ok_or_else(|| {
+            Error::BackendError(format!(
+                "Failed to extract light simplify anchor for sort {} value {}",
+                sort.name(),
+                self.get_canonical_value(value, sort).rep()
+            ))
+        })
+    }
+
+    pub fn extract_light_simplify_anchors(
+        &self,
+        sort: &ArcSort,
+        value: Value,
+        nanchors: usize,
+    ) -> Result<Vec<LightSimplifyAnchor>, Error> {
+        let canonical_root = self.get_canonical_value(value, sort);
+        let extractor = Extractor::compute_costs_from_rootsorts(
+            Some(vec![sort.clone()]),
+            self,
+            TreeAdditiveCostModel::default(),
+        );
+        let mut termdag = TermDag::default();
+        let variants = extractor.extract_anchor_variants_with_sort(
+            self,
+            canonical_root,
+            std::cmp::max(1, nanchors),
+            sort.clone(),
+        );
+        if variants.is_empty() {
+            return Err(Error::BackendError(format!(
+                "Failed to extract light simplify anchor for sort {} value {}",
+                sort.name(),
+                canonical_root.rep()
+            )));
+        }
+
+        let mut anchors = Vec::with_capacity(variants.len());
+        for (cost, func_name, row_vals) in variants {
+            let func = self.functions.get(&func_name).unwrap();
+            let num_children = func.extraction_num_children();
+            let mut child_terms: Vec<TermId> = Vec::with_capacity(num_children);
+            let mut reconstruct_cache: HashMap<(Value, String), TermId> = Default::default();
+            let mut class_costs: HashMap<String, HashMap<Value, DefaultCost>> = Default::default();
+            let mut pinned_rows: HashSet<(String, Vec<Value>)> = Default::default();
+            class_costs
+                .entry(sort.name().to_owned())
+                .or_default()
+                .insert(canonical_root, cost);
+            pinned_rows.insert((
+                func_name.clone(),
+                row_vals[..func.schema.input.len()].to_vec(),
+            ));
+            for (child_value, child_sort) in row_vals
+                .iter()
+                .take(num_children)
+                .zip(func.schema.input.iter())
+            {
+                child_terms.push(extractor.reconstruct_termdag_node_helper(
+                    self,
+                    &mut termdag,
+                    *child_value,
+                    child_sort,
+                    &mut reconstruct_cache,
+                ));
+                extractor.collect_best_tree_anchor_entries(
+                    self,
+                    *child_value,
+                    child_sort,
+                    &mut class_costs,
+                );
+                extractor.collect_best_tree_anchor_rows(
+                    self,
+                    *child_value,
+                    child_sort,
+                    &mut pinned_rows,
+                );
+            }
+
+            let term = termdag.app(func.extraction_term_name().to_string(), child_terms);
+            let mut entries = Vec::new();
+            for (sort_name, by_value) in class_costs {
+                for (class_value, best_cost) in by_value {
+                    entries.push(LightSimplifyAnchorEntry {
+                        sort: sort_name.clone(),
+                        value: class_value.rep() as i64,
+                        best_cost,
+                    });
+                }
+            }
+            entries.sort_by(|a, b| {
+                a.sort
+                    .cmp(&b.sort)
+                    .then_with(|| a.value.cmp(&b.value))
+                    .then_with(|| a.best_cost.cmp(&b.best_cost))
+            });
+            let mut pinned_rows: Vec<LightSimplifyPinnedRow> = pinned_rows
+                .into_iter()
+                .map(|(func, key)| LightSimplifyPinnedRow {
+                    func,
+                    key: key.into_iter().map(|v| v.rep() as i64).collect(),
+                })
+                .collect();
+            pinned_rows.sort_by(|a, b| a.func.cmp(&b.func).then_with(|| a.key.cmp(&b.key)));
+            anchors.push(LightSimplifyAnchor {
+                term: termdag.to_string(term),
+                cost,
+                root_sort: sort.name().to_string(),
+                root_value: canonical_root.rep() as i64,
+                entries,
+                pinned_rows,
+            });
+        }
+
+        Ok(anchors)
+    }
+
+    pub fn extract_light_simplify_anchor_expr(
+        &mut self,
+        expr: &Expr,
+    ) -> Result<LightSimplifyAnchor, Error> {
+        let (sort, value) = self.eval_expr(expr)?;
+        self.extract_light_simplify_anchor(&sort, value)
+    }
+
+    pub fn light_simplify_with_anchor(
+        &mut self,
+        sort: &ArcSort,
+        value: Value,
+        theta: f64,
+        anchor: &LightSimplifyAnchor,
+    ) -> Result<LightSimplifyReport, Error> {
+        self.light_simplify_with_anchors(sort, value, theta, std::slice::from_ref(anchor))
+    }
+
+    pub fn light_simplify_with_anchors(
+        &mut self,
+        sort: &ArcSort,
+        value: Value,
+        theta: f64,
+        anchors: &[LightSimplifyAnchor],
+    ) -> Result<LightSimplifyReport, Error> {
+        if !theta.is_finite() || theta < 0.0 {
+            return Err(Error::BackendError(format!(
+                "light_simplify theta must be finite and >= 0.0, got {theta}"
+            )));
+        }
+        if anchors.is_empty() {
+            return Err(Error::BackendError(
+                "light_simplify_with_anchors requires at least one anchor".to_string(),
+            ));
+        }
+
+        let canonical_root = self.get_canonical_value(value, sort);
+        let best_costs = light_anchor_cost_map(anchors);
+
+        let before_classes: usize = best_costs.values().map(HashMap::len).sum();
+        let mut before_nodes = 0usize;
+        let mut after_nodes = 0usize;
+        let mut after_classes: HashSet<(String, Value)> = Default::default();
+        let mut threshold_pruned_nodes = 0usize;
+        let mut to_remove: Vec<(String, Vec<Value>)> = Vec::new();
+        let ratio_mode = theta <= 1.0 + 1e-9;
+        let pinned_rows: HashSet<(String, Vec<Value>)> = anchors
+            .first()
+            .map(|anchor| {
+                anchor
+                    .pinned_rows
+                    .iter()
+                    .map(|row| {
+                        (
+                            row.func.clone(),
+                            row.key
+                                .iter()
+                                .map(|value| Value::from_usize(*value as usize))
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        for func_name in self
+            .functions
+            .iter()
+            .filter_map(|(name, func)| {
+                if func.decl.subtype == FunctionSubtype::Constructor
+                    && !func.decl.unextractable
+                    && !func.decl.internal_hidden
+                {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            })
+        {
+            let func = self.functions.get(&func_name).unwrap();
+            let target_sort = func.extraction_output_sort();
+            let Some(target_values) = best_costs.get(target_sort.name()) else {
+                continue;
+            };
+            let output_idx = func.extraction_output_index();
+            let output_col = core_relations::ColumnId::from_usize(output_idx);
+            for (&target_value, &best_cost) in target_values {
+                if ratio_mode {
+                    let mut candidates: Vec<(Option<DefaultCost>, bool, Vec<Value>)> = Vec::new();
+                    self.backend.for_each_col_eq_while(
+                        func.backend_id,
+                        output_col,
+                        target_value,
+                        |row: egglog_bridge::FunctionRow| {
+                            if row.subsumed {
+                                return true;
+                            }
+                            before_nodes += 1;
+                            let row_cost = light_anchor_row_cost(self, func, &row, &best_costs);
+                            let key = row.vals[..func.schema.input.len()].to_vec();
+                            let pinned = pinned_rows.contains(&(func_name.clone(), key.clone()));
+                            candidates.push((row_cost, pinned, key));
+                            true
+                        },
+                    );
+                    if candidates.is_empty() {
+                        continue;
+                    }
+                    after_classes.insert((target_sort.name().to_owned(), target_value));
+                    candidates.sort_by(|(cost_a, pinned_a, key_a), (cost_b, pinned_b, key_b)| {
+                        pinned_b
+                            .cmp(pinned_a)
+                            .then_with(|| {
+                                let rank_a = if cost_a.is_some() { 0u8 } else { 1u8 };
+                                let rank_b = if cost_b.is_some() { 0u8 } else { 1u8 };
+                                rank_a.cmp(&rank_b)
+                            })
+                            .then_with(|| cost_a.cmp(cost_b))
+                            .then_with(|| key_a.cmp(key_b))
+                    });
+                    let pinned_count = candidates.iter().filter(|(_, pinned, _)| *pinned).count();
+                    let baseline_keep = usize::max(1, pinned_count);
+                    let extra_capacity = candidates.len().saturating_sub(baseline_keep);
+                    let extra_keep =
+                        ((1.0 - theta.clamp(0.0, 1.0)) * extra_capacity as f64).floor() as usize;
+                    let keep_count = baseline_keep + extra_keep.min(extra_capacity);
+                    after_nodes += keep_count;
+
+                    for (_, _, key) in candidates.into_iter().skip(keep_count) {
+                        threshold_pruned_nodes += 1;
+                        to_remove.push((func_name.clone(), key));
+                    }
+                } else {
+                    self.backend.for_each_col_eq_while(
+                        func.backend_id,
+                        output_col,
+                        target_value,
+                        |row: egglog_bridge::FunctionRow| {
+                            if row.subsumed {
+                                return true;
+                            }
+                            before_nodes += 1;
+                            let Some(row_cost) =
+                                light_anchor_row_cost(self, func, &row, &best_costs)
+                            else {
+                                after_nodes += 1;
+                                after_classes
+                                    .insert((target_sort.name().to_owned(), target_value));
+                                return true;
+                            };
+                            if (row_cost as f64) <= (best_cost as f64) * theta + 1e-9 {
+                                after_nodes += 1;
+                                after_classes
+                                    .insert((target_sort.name().to_owned(), target_value));
+                            } else {
+                                threshold_pruned_nodes += 1;
+                                to_remove.push((
+                                    func_name.clone(),
+                                    row.vals[..func.schema.input.len()].to_vec(),
+                                ));
+                            }
+                            true
+                        },
+                    );
+                }
+            }
+        }
+
+        let mut removed_function_rows = 0usize;
+        let mut table_actions: HashMap<egglog_bridge::FunctionId, egglog_bridge::TableAction> =
+            Default::default();
+        self.backend.with_execution_state(|es| {
+            for (func_name, key) in &to_remove {
+                let function = self.functions.get(func_name).unwrap();
+                let table_action = table_actions.entry(function.backend_id).or_insert_with(|| {
+                    egglog_bridge::TableAction::new(&self.backend, function.backend_id)
+                });
+                table_action.remove(es, key);
+                removed_function_rows += 1;
+            }
+        });
+        if removed_function_rows > 0 {
+            self.backend.flush_updates();
+        }
+
+        Ok(LightSimplifyReport {
+            theta,
+            root_sort: sort.name().to_string(),
+            root_value: canonical_root.rep() as i64,
+            before_nodes,
+            after_nodes,
+            before_classes,
+            after_classes: after_classes.len(),
+            threshold_pruned_nodes,
+            redundancy_pruned_nodes: 0,
+            removed_function_rows,
+        })
+    }
+
+    pub fn light_simplify_expr_with_anchor(
+        &mut self,
+        expr: &Expr,
+        anchor: &LightSimplifyAnchor,
+        theta: f64,
+    ) -> Result<LightSimplifyReport, Error> {
+        let (sort, value) = self.eval_expr(expr)?;
+        self.light_simplify_with_anchor(&sort, value, theta, anchor)
+    }
+
     pub fn light_simplify(
         &mut self,
         sort: &ArcSort,
         value: Value,
         theta: f64,
     ) -> Result<LightSimplifyReport, Error> {
-        if !theta.is_finite() || theta < 1.0 {
+        if !theta.is_finite() || theta < 0.0 {
             return Err(Error::BackendError(format!(
-                "light_simplify theta must be finite and >= 1.0, got {theta}"
+                "light_simplify theta must be finite and >= 0.0, got {theta}"
             )));
         }
 
-        let config = SerializeConfig {
-            max_functions: None,
-            max_calls_per_function: None,
-            include_temporary_functions: false,
-            root_eclasses: vec![(sort.clone(), value)],
-        };
-        let before = self.serialize(config).egraph;
+        let profile = std::env::var_os("EGGMIND_LIGHT_SIMPLIFY_PROFILE").is_some();
+        let anchor_t0 = Instant::now();
+        let anchors =
+            self.extract_light_simplify_anchors(sort, value, LIGHT_SIMPLIFY_NUM_ANCHORS)?;
+        let anchor_dt = anchor_t0.elapsed();
+        let merged_classes: usize = light_anchor_cost_map(&anchors)
+            .values()
+            .map(HashMap::len)
+            .sum();
+        let report = self.light_simplify_with_anchors(sort, value, theta, &anchors)?;
 
-        let mut infos: BTreeMap<String, LightSimplifyNodeInfo> = BTreeMap::new();
-        let mut nodes_by_eclass: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for (node_id, node) in &before.nodes {
-            let node_id_text = node_id.to_string();
-            let child_eclasses: Vec<String> = node
-                .children
-                .iter()
-                .filter_map(|child_id| {
-                    before
-                        .nodes
-                        .get(child_id)
-                        .map(|child| child.eclass.to_string())
-                })
-                .collect();
-            let removable_function = light_simplify_function_name(&self.from_node_id(node_id));
-            let info = LightSimplifyNodeInfo {
-                eclass: node.eclass.to_string(),
-                child_eclasses,
-                base_cost: node.cost.into_inner(),
-                removable_function,
-            };
-            nodes_by_eclass
-                .entry(info.eclass.clone())
-                .or_default()
-                .push(node_id_text.clone());
-            infos.insert(node_id_text, info);
+        if profile {
+            eprintln!(
+                "light_simplify anchor_seed_s={:.3} root_sort={} root_value={} anchors={} merged_anchor_classes={}",
+                anchor_dt.as_secs_f64(),
+                sort.name(),
+                self.get_canonical_value(value, sort).rep(),
+                anchors.len(),
+                merged_classes,
+            );
         }
 
-        // Keep light simplify genuinely light: tree-cost thresholding within each
-        // eclass only. Avoid any heavier global scoring or signature-based dedup.
-        let (class_costs, node_costs, best_nodes) =
-            light_compute_tree_costs(&infos, &nodes_by_eclass);
-
-        let mut retained = BTreeSet::new();
-        let mut threshold_pruned_nodes = 0usize;
-        for (cid, node_ids) in &nodes_by_eclass {
-            let best_cost = class_costs.get(cid).copied().unwrap_or(f64::INFINITY);
-            let limit = best_cost * theta;
-            for node_id in node_ids {
-                let cost = node_costs.get(node_id).copied().unwrap_or(f64::INFINITY);
-                if cost <= limit || best_nodes.get(cid) == Some(node_id) {
-                    retained.insert(node_id.clone());
-                } else {
-                    threshold_pruned_nodes += 1;
-                }
-            }
-            if !node_ids.iter().any(|node_id| retained.contains(node_id)) {
-                if let Some(best_node_id) = best_nodes.get(cid) {
-                    retained.insert(best_node_id.clone());
-                }
-            }
-        }
-
-        let mut removed_function_rows = 0usize;
-        for (node_id, info) in &infos {
-            let Some(func_name) = &info.removable_function else {
-                continue;
-            };
-            if retained.contains(node_id) {
-                continue;
-            }
-            let Some(function) = self.functions.get(func_name) else {
-                continue;
-            };
-            let key: Vec<Value> = info
-                .child_eclasses
-                .iter()
-                .map(|cid| self.class_id_to_value(&cid.clone().into()))
-                .collect();
-            let table_action = egglog_bridge::TableAction::new(&self.backend, function.backend_id);
-            self.backend.with_execution_state(|es| {
-                table_action.remove(es, &key);
-            });
-            removed_function_rows += 1;
-        }
-        if removed_function_rows > 0 {
-            self.backend.flush_updates();
-        }
-
-        let after = self
-            .serialize(SerializeConfig {
-                max_functions: None,
-                max_calls_per_function: None,
-                include_temporary_functions: false,
-                root_eclasses: vec![(sort.clone(), value)],
-            })
-            .egraph;
-
-        Ok(LightSimplifyReport {
-            theta,
-            root_sort: sort.name().to_string(),
-            root_value: value.rep() as i64,
-            before_nodes: before.nodes.len(),
-            after_nodes: after.nodes.len(),
-            before_classes: before.class_data.len(),
-            after_classes: after.class_data.len(),
-            threshold_pruned_nodes,
-            redundancy_pruned_nodes: 0,
-            removed_function_rows,
-        })
+        Ok(report)
     }
 
     pub fn light_simplify_expr(

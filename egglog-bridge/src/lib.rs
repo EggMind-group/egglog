@@ -23,12 +23,12 @@ use crate::core_relations::{
     ExternalFunction, ExternalFunctionId, MergeVal, Offset, PlanStrategy, SortedWritesTable,
     TableId, TaggedRowBuffer, Value, WrappedTable,
 };
-use crate::numeric_id::{DenseIdMap, DenseIdMapWithReuse, IdVec, NumericId, define_id};
+use crate::numeric_id::{define_id, DenseIdMap, DenseIdMapWithReuse, IdVec, NumericId};
 use egglog_core_relations as core_relations;
 use egglog_numeric_id as numeric_id;
 use egglog_reports::{IterationReport, ReportLevel, RuleSetReport};
 use hashbrown::HashMap;
-use indexmap::{IndexMap, IndexSet, map::Entry};
+use indexmap::{map::Entry, IndexMap, IndexSet};
 use log::info;
 use once_cell::sync::Lazy;
 pub use proof_format::{EqProofId, ProofStore, TermProofId};
@@ -661,6 +661,34 @@ impl EGraph {
             cur = next;
         }
         drain_buf!(buf);
+    }
+
+    /// Iterate over rows whose value in the given function column equals `value`.
+    ///
+    /// This uses a cached single-column index in the underlying database and
+    /// stops early if `f` returns `false`.
+    pub fn for_each_col_eq_while(
+        &self,
+        table: FunctionId,
+        col: ColumnId,
+        value: Value,
+        mut f: impl FnMut(FunctionRow<'_>) -> bool,
+    ) {
+        let info = &self.funcs[table];
+        let table_id = info.table;
+        let schema_math = SchemaMath {
+            tracing: self.tracing,
+            subsume: info.can_subsume,
+            func_cols: info.schema.len(),
+        };
+        self.db
+            .for_each_row_col_eq_while(table_id, col, value, |_, row| {
+                let subsumed = schema_math.subsume && row[schema_math.subsume_col()] == SUBSUMED;
+                f(FunctionRow {
+                    vals: &row[0..schema_math.func_cols],
+                    subsumed,
+                })
+            });
     }
 
     /// A basic method for dumping the state of the database to `log::info!`.
