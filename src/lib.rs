@@ -74,6 +74,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
+use std::collections::{HashMap as StdHashMap, HashSet as StdHashSet, VecDeque};
 pub use termdag::{Term, TermDag, TermId};
 use thiserror::Error;
 pub use typechecking::PrimitiveValidator;
@@ -341,6 +342,8 @@ pub struct LightSimplifyReport {
     pub threshold_pruned_nodes: usize,
     pub redundancy_pruned_nodes: usize,
     pub removed_function_rows: usize,
+    pub pattern_penalized_nodes: usize,
+    pub total_pattern_penalty: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -364,6 +367,46 @@ pub struct LightSimplifyAnchor {
     pub root_value: i64,
     pub entries: Vec<LightSimplifyAnchorEntry>,
     pub pinned_rows: Vec<LightSimplifyPinnedRow>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DeleteClosureClass {
+    pub sort: String,
+    pub value: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DeleteClosureRemovedRow {
+    pub function_name: String,
+    pub key_values: Vec<i64>,
+    pub output_class: DeleteClosureClass,
+    pub child_classes: Vec<DeleteClosureClass>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DeleteClosureReport {
+    pub seed_term: String,
+    pub seed_function: String,
+    pub deleted_rows: Vec<DeleteClosureRemovedRow>,
+    pub deleted_eclasses: Vec<DeleteClosureClass>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct DeleteClosureClassKey {
+    sort: String,
+    value: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct DeleteClosureRowKey {
+    function_name: String,
+    key_values: Vec<Value>,
+}
+
+#[derive(Clone, Debug)]
+struct DeleteClosureRowInfo {
+    output_class: DeleteClosureClassKey,
+    child_classes: Vec<DeleteClosureClassKey>,
 }
 
 const LIGHT_SIMPLIFY_NUM_ANCHORS: usize = 3;
@@ -418,6 +461,15 @@ fn light_anchor_row_cost(
         )?);
     }
     Some(total)
+}
+
+fn light_anchor_row_penalty(
+    func_name: &str,
+    row: &egglog_bridge::FunctionRow,
+    row_penalties: &StdHashMap<String, f64>,
+) -> f64 {
+    let node_id = format!("function-{}-{}", row.offset, func_name);
+    row_penalties.get(&node_id).copied().unwrap_or(0.0)
 }
 
 fn light_anchor_cost_map(
@@ -1911,6 +1963,234 @@ impl EGraph {
         self.functions.get(name)
     }
 
+    fn delete_closure_seed_from_expr(
+        &mut self,
+        expr: &Expr,
+    ) -> Result<DeleteClosureRowKey, Error> {
+        let Expr::Call(_, head, children) = expr else {
+            return Err(Error::BackendError(
+                "delete_closure expects a concrete constructor application".to_string(),
+            ));
+        };
+        let function = self
+            .functions
+            .get(head)
+            .ok_or_else(|| Error::BackendError(format!("Unknown function in delete_closure: {head}")))?;
+        let subtype = function.decl.subtype;
+        let input_sorts = function.schema.input.clone();
+        if subtype != FunctionSubtype::Constructor {
+            return Err(Error::BackendError(format!(
+                "delete_closure only supports constructors, got: {head}"
+            )));
+        }
+        if children.len() != input_sorts.len() {
+            return Err(Error::BackendError(format!(
+                "delete_closure arity mismatch for {head}: expected {}, got {}",
+                input_sorts.len(),
+                children.len()
+            )));
+        }
+
+        let mut key_values = Vec::with_capacity(children.len());
+        for (child_expr, child_sort) in children.iter().zip(input_sorts.iter()) {
+            let (_, value) = self.eval_expr(child_expr)?;
+            let value = if child_sort.is_eq_sort() {
+                self.get_canonical_value(value, child_sort)
+            } else {
+                value
+            };
+            key_values.push(value);
+        }
+        Ok(DeleteClosureRowKey {
+            function_name: head.clone(),
+            key_values,
+        })
+    }
+
+    fn snapshot_delete_closure_rows(&self) -> StdHashMap<DeleteClosureRowKey, DeleteClosureRowInfo> {
+        let mut rows = StdHashMap::new();
+        for (function_name, function) in self.functions.iter() {
+            if function.decl.subtype != FunctionSubtype::Constructor
+                || function.decl.internal_hidden
+                || function.decl.internal_let
+            {
+                continue;
+            }
+            let input_sorts = function.schema.input.clone();
+            let output_sort = function.schema.output.clone();
+            self.backend.for_each(function.backend_id, |row: egglog_bridge::FunctionRow| {
+                if row.subsumed {
+                    return;
+                }
+                let key_values = row.vals[..input_sorts.len()].to_vec();
+                let output_value = row.vals[input_sorts.len()];
+                let output_value = if output_sort.is_eq_sort() {
+                    self.get_canonical_value(output_value, &output_sort)
+                } else {
+                    output_value
+                };
+                let child_classes = key_values
+                    .iter()
+                    .copied()
+                    .zip(input_sorts.iter())
+                    .filter_map(|(value, sort)| {
+                        if sort.is_eq_sort() {
+                            Some(DeleteClosureClassKey {
+                                sort: sort.name().to_string(),
+                                value: self.get_canonical_value(value, sort),
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                rows.insert(
+                    DeleteClosureRowKey {
+                        function_name: function_name.clone(),
+                        key_values: key_values.clone(),
+                    },
+                    DeleteClosureRowInfo {
+                        output_class: DeleteClosureClassKey {
+                            sort: output_sort.name().to_string(),
+                            value: output_value,
+                        },
+                        child_classes,
+                    },
+                );
+            });
+        }
+        rows
+    }
+
+    pub fn delete_closure_expr(&mut self, expr: &Expr) -> Result<DeleteClosureReport, Error> {
+        let seed = self.delete_closure_seed_from_expr(expr)?;
+        let rows = self.snapshot_delete_closure_rows();
+        if !rows.contains_key(&seed) {
+            return Err(Error::BackendError(format!(
+                "delete_closure could not find a live constructor row for {}",
+                expr
+            )));
+        }
+
+        let mut class_rows: StdHashMap<DeleteClosureClassKey, Vec<DeleteClosureRowKey>> =
+            StdHashMap::new();
+        let mut remaining_parents: StdHashMap<DeleteClosureClassKey, usize> = StdHashMap::new();
+        for (row_key, row_info) in &rows {
+            class_rows
+                .entry(row_info.output_class.clone())
+                .or_default()
+                .push(row_key.clone());
+            let mut unique_children = StdHashSet::new();
+            for child_class in &row_info.child_classes {
+                if unique_children.insert(child_class.clone()) {
+                    *remaining_parents.entry(child_class.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+
+        let mut closure: StdHashSet<DeleteClosureRowKey> = StdHashSet::new();
+        let mut dead_classes: StdHashSet<DeleteClosureClassKey> = StdHashSet::new();
+        let mut queue: VecDeque<DeleteClosureClassKey> = VecDeque::new();
+
+        let register_row = |row_key: &DeleteClosureRowKey,
+                            closure: &mut StdHashSet<DeleteClosureRowKey>,
+                            remaining_parents: &mut StdHashMap<DeleteClosureClassKey, usize>,
+                            queue: &mut VecDeque<DeleteClosureClassKey>| {
+            if !closure.insert(row_key.clone()) {
+                return;
+            }
+            let row_info = rows.get(row_key).unwrap();
+            let mut unique_children = StdHashSet::new();
+            for child_class in &row_info.child_classes {
+                if !unique_children.insert(child_class.clone()) {
+                    continue;
+                }
+                if let Some(count) = remaining_parents.get_mut(child_class) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        queue.push_back(child_class.clone());
+                    }
+                }
+            }
+        };
+
+        register_row(&seed, &mut closure, &mut remaining_parents, &mut queue);
+
+        while let Some(class_key) = queue.pop_front() {
+            if !dead_classes.insert(class_key.clone()) {
+                continue;
+            }
+            for row_key in class_rows.get(&class_key).cloned().unwrap_or_default() {
+                register_row(&row_key, &mut closure, &mut remaining_parents, &mut queue);
+            }
+        }
+
+        let mut deleted_row_keys = closure.into_iter().collect::<Vec<_>>();
+        deleted_row_keys.sort_by(|a, b| {
+            a.function_name
+                .cmp(&b.function_name)
+                .then_with(|| a.key_values.cmp(&b.key_values))
+        });
+
+        let mut table_actions: StdHashMap<egglog_bridge::FunctionId, egglog_bridge::TableAction> =
+            StdHashMap::new();
+        self.backend.with_execution_state(|es| {
+            for row_key in &deleted_row_keys {
+                let function = self.functions.get(&row_key.function_name).unwrap();
+                let table_action = table_actions
+                    .entry(function.backend_id)
+                    .or_insert_with(|| egglog_bridge::TableAction::new(&self.backend, function.backend_id));
+                table_action.remove(es, &row_key.key_values);
+            }
+        });
+        if !deleted_row_keys.is_empty() {
+            self.backend.flush_updates();
+        }
+
+        let deleted_rows = deleted_row_keys
+            .into_iter()
+            .map(|row_key| {
+                let row_info = rows.get(&row_key).unwrap();
+                DeleteClosureRemovedRow {
+                    function_name: row_key.function_name,
+                    key_values: row_key
+                        .key_values
+                        .into_iter()
+                        .map(|value| value.rep() as i64)
+                        .collect(),
+                    output_class: DeleteClosureClass {
+                        sort: row_info.output_class.sort.clone(),
+                        value: row_info.output_class.value.rep() as i64,
+                    },
+                    child_classes: row_info
+                        .child_classes
+                        .iter()
+                        .map(|child| DeleteClosureClass {
+                            sort: child.sort.clone(),
+                            value: child.value.rep() as i64,
+                        })
+                        .collect(),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut deleted_eclasses = dead_classes
+            .into_iter()
+            .map(|class_key| DeleteClosureClass {
+                sort: class_key.sort,
+                value: class_key.value.rep() as i64,
+            })
+            .collect::<Vec<_>>();
+        deleted_eclasses.sort_by(|a, b| a.sort.cmp(&b.sort).then_with(|| a.value.cmp(&b.value)));
+
+        Ok(DeleteClosureReport {
+            seed_term: format!("{}", expr),
+            seed_function: seed.function_name,
+            deleted_rows,
+            deleted_eclasses,
+        })
+    }
+
     /// Evaluate an expression and return the canonical sort/value pair that identifies its e-class.
     pub fn lookup_expr(&mut self, expr: &Expr) -> Result<(ArcSort, Value), Error> {
         self.eval_expr(expr)
@@ -2126,7 +2406,30 @@ impl EGraph {
         theta: f64,
         anchor: &LightSimplifyAnchor,
     ) -> Result<LightSimplifyReport, Error> {
-        self.light_simplify_with_anchors(sort, value, theta, std::slice::from_ref(anchor))
+        self.light_simplify_with_anchor_and_penalties(
+            sort,
+            value,
+            theta,
+            anchor,
+            &StdHashMap::default(),
+        )
+    }
+
+    pub fn light_simplify_with_anchor_and_penalties(
+        &mut self,
+        sort: &ArcSort,
+        value: Value,
+        theta: f64,
+        anchor: &LightSimplifyAnchor,
+        row_penalties: &StdHashMap<String, f64>,
+    ) -> Result<LightSimplifyReport, Error> {
+        self.light_simplify_with_anchors_and_penalties(
+            sort,
+            value,
+            theta,
+            std::slice::from_ref(anchor),
+            row_penalties,
+        )
     }
 
     pub fn light_simplify_with_anchors(
@@ -2135,6 +2438,23 @@ impl EGraph {
         value: Value,
         theta: f64,
         anchors: &[LightSimplifyAnchor],
+    ) -> Result<LightSimplifyReport, Error> {
+        self.light_simplify_with_anchors_and_penalties(
+            sort,
+            value,
+            theta,
+            anchors,
+            &StdHashMap::default(),
+        )
+    }
+
+    pub fn light_simplify_with_anchors_and_penalties(
+        &mut self,
+        sort: &ArcSort,
+        value: Value,
+        theta: f64,
+        anchors: &[LightSimplifyAnchor],
+        row_penalties: &StdHashMap<String, f64>,
     ) -> Result<LightSimplifyReport, Error> {
         if !theta.is_finite() || theta < 0.0 {
             return Err(Error::BackendError(format!(
@@ -2156,6 +2476,8 @@ impl EGraph {
         let mut after_classes: HashSet<(String, Value)> = Default::default();
         let mut threshold_pruned_nodes = 0usize;
         let mut to_remove: Vec<(String, Vec<Value>)> = Vec::new();
+        let mut pattern_penalized_nodes = 0usize;
+        let mut total_pattern_penalty = 0.0f64;
         let ratio_mode = theta <= 1.0 + 1e-9;
         let pinned_rows: HashSet<(String, Vec<Value>)> = anchors
             .first()
@@ -2198,40 +2520,53 @@ impl EGraph {
             let output_idx = func.extraction_output_index();
             let output_col = core_relations::ColumnId::from_usize(output_idx);
             for (&target_value, &best_cost) in target_values {
+                let mut candidates: Vec<(Option<DefaultCost>, f64, bool, Vec<Value>)> = Vec::new();
+                self.backend.for_each_col_eq_while(
+                    func.backend_id,
+                    output_col,
+                    target_value,
+                    |row: egglog_bridge::FunctionRow| {
+                        if row.subsumed {
+                            return true;
+                        }
+                        before_nodes += 1;
+                        let row_cost = light_anchor_row_cost(self, func, &row, &best_costs);
+                        let penalty = light_anchor_row_penalty(&func_name, &row, row_penalties);
+                        if penalty > 0.0 {
+                            pattern_penalized_nodes += 1;
+                            total_pattern_penalty += penalty;
+                        }
+                        let key = row.vals[..func.schema.input.len()].to_vec();
+                        let pinned = pinned_rows.contains(&(func_name.clone(), key.clone()));
+                        let weighted_score = row_cost.map_or(f64::INFINITY, |cost| cost as f64 + penalty);
+                        candidates.push((row_cost, weighted_score, pinned, key));
+                        true
+                    },
+                );
+                if candidates.is_empty() {
+                    continue;
+                }
+                after_classes.insert((target_sort.name().to_owned(), target_value));
+
                 if ratio_mode {
-                    let mut candidates: Vec<(Option<DefaultCost>, bool, Vec<Value>)> = Vec::new();
-                    self.backend.for_each_col_eq_while(
-                        func.backend_id,
-                        output_col,
-                        target_value,
-                        |row: egglog_bridge::FunctionRow| {
-                            if row.subsumed {
-                                return true;
-                            }
-                            before_nodes += 1;
-                            let row_cost = light_anchor_row_cost(self, func, &row, &best_costs);
-                            let key = row.vals[..func.schema.input.len()].to_vec();
-                            let pinned = pinned_rows.contains(&(func_name.clone(), key.clone()));
-                            candidates.push((row_cost, pinned, key));
-                            true
+                    candidates.sort_by(
+                        |(cost_a, weighted_a, pinned_a, key_a), (cost_b, weighted_b, pinned_b, key_b)| {
+                            pinned_b
+                                .cmp(pinned_a)
+                                .then_with(|| {
+                                    let rank_a = if cost_a.is_some() { 0u8 } else { 1u8 };
+                                    let rank_b = if cost_b.is_some() { 0u8 } else { 1u8 };
+                                    rank_a.cmp(&rank_b)
+                                })
+                                .then_with(|| weighted_a.total_cmp(weighted_b))
+                                .then_with(|| cost_a.cmp(cost_b))
+                                .then_with(|| key_a.cmp(key_b))
                         },
                     );
-                    if candidates.is_empty() {
-                        continue;
-                    }
-                    after_classes.insert((target_sort.name().to_owned(), target_value));
-                    candidates.sort_by(|(cost_a, pinned_a, key_a), (cost_b, pinned_b, key_b)| {
-                        pinned_b
-                            .cmp(pinned_a)
-                            .then_with(|| {
-                                let rank_a = if cost_a.is_some() { 0u8 } else { 1u8 };
-                                let rank_b = if cost_b.is_some() { 0u8 } else { 1u8 };
-                                rank_a.cmp(&rank_b)
-                            })
-                            .then_with(|| cost_a.cmp(cost_b))
-                            .then_with(|| key_a.cmp(key_b))
-                    });
-                    let pinned_count = candidates.iter().filter(|(_, pinned, _)| *pinned).count();
+                    let pinned_count = candidates
+                        .iter()
+                        .filter(|(_, _, pinned, _)| *pinned)
+                        .count();
                     let baseline_keep = usize::max(1, pinned_count);
                     let extra_capacity = candidates.len().saturating_sub(baseline_keep);
                     let extra_keep =
@@ -2239,42 +2574,24 @@ impl EGraph {
                     let keep_count = baseline_keep + extra_keep.min(extra_capacity);
                     after_nodes += keep_count;
 
-                    for (_, _, key) in candidates.into_iter().skip(keep_count) {
+                    for (_, _, _, key) in candidates.into_iter().skip(keep_count) {
                         threshold_pruned_nodes += 1;
                         to_remove.push((func_name.clone(), key));
                     }
                 } else {
-                    self.backend.for_each_col_eq_while(
-                        func.backend_id,
-                        output_col,
-                        target_value,
-                        |row: egglog_bridge::FunctionRow| {
-                            if row.subsumed {
-                                return true;
-                            }
-                            before_nodes += 1;
-                            let Some(row_cost) =
-                                light_anchor_row_cost(self, func, &row, &best_costs)
-                            else {
-                                after_nodes += 1;
-                                after_classes
-                                    .insert((target_sort.name().to_owned(), target_value));
-                                return true;
-                            };
-                            if (row_cost as f64) <= (best_cost as f64) * theta + 1e-9 {
-                                after_nodes += 1;
-                                after_classes
-                                    .insert((target_sort.name().to_owned(), target_value));
-                            } else {
-                                threshold_pruned_nodes += 1;
-                                to_remove.push((
-                                    func_name.clone(),
-                                    row.vals[..func.schema.input.len()].to_vec(),
-                                ));
-                            }
-                            true
-                        },
-                    );
+                    let best_weighted = candidates
+                        .iter()
+                        .filter_map(|(row_cost, weighted, _, _)| row_cost.map(|_| *weighted))
+                        .min_by(|a, b| a.total_cmp(b))
+                        .unwrap_or(best_cost as f64);
+                    for (row_cost, weighted_score, _pinned, key) in candidates {
+                        if row_cost.is_none() || weighted_score <= best_weighted * theta + 1e-9 {
+                            after_nodes += 1;
+                        } else {
+                            threshold_pruned_nodes += 1;
+                            to_remove.push((func_name.clone(), key));
+                        }
+                    }
                 }
             }
         }
@@ -2307,6 +2624,8 @@ impl EGraph {
             threshold_pruned_nodes,
             redundancy_pruned_nodes: 0,
             removed_function_rows,
+            pattern_penalized_nodes,
+            total_pattern_penalty,
         })
     }
 
@@ -2318,6 +2637,17 @@ impl EGraph {
     ) -> Result<LightSimplifyReport, Error> {
         let (sort, value) = self.eval_expr(expr)?;
         self.light_simplify_with_anchor(&sort, value, theta, anchor)
+    }
+
+    pub fn light_simplify_expr_with_anchor_and_penalties(
+        &mut self,
+        expr: &Expr,
+        anchor: &LightSimplifyAnchor,
+        theta: f64,
+        row_penalties: &StdHashMap<String, f64>,
+    ) -> Result<LightSimplifyReport, Error> {
+        let (sort, value) = self.eval_expr(expr)?;
+        self.light_simplify_with_anchor_and_penalties(&sort, value, theta, anchor, row_penalties)
     }
 
     pub fn light_simplify(
@@ -2745,6 +3075,77 @@ mod tests {
         let id = get_function(egraph, name).backend_id;
         egraph.backend.for_each(id, |row| out = Some(row.vals[0]));
         out.unwrap()
+    }
+
+    #[test]
+    fn delete_closure_expr_removes_dead_chain() {
+        let mut egraph = EGraph::default();
+        egraph
+            .parse_and_run_program(
+                None,
+                r#"
+                (datatype Expr
+                  (Leaf)
+                  (Mid Expr)
+                  (Top Expr))
+                (let root (Top (Mid (Leaf))))
+                "#,
+            )
+            .unwrap();
+
+        let expr = egraph
+            .parser
+            .get_expr_from_string(None, "(Top (Mid (Leaf)))")
+            .unwrap();
+        let report = egraph.delete_closure_expr(&expr).unwrap();
+
+        let deleted_funcs = report
+            .deleted_rows
+            .iter()
+            .map(|row| row.function_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(deleted_funcs, vec!["Leaf", "Mid", "Top"]);
+        assert_eq!(egraph.get_size("Leaf"), 0);
+        assert_eq!(egraph.get_size("Mid"), 0);
+        assert_eq!(egraph.get_size("Top"), 0);
+    }
+
+    #[test]
+    fn delete_closure_expr_preserves_shared_child_class() {
+        let mut egraph = EGraph::default();
+        egraph
+            .parse_and_run_program(
+                None,
+                r#"
+                (datatype Expr
+                  (Leaf)
+                  (Mid Expr)
+                  (Alt Expr)
+                  (Pair Expr Expr)
+                  (Hold Expr))
+                (let root (Pair (Mid (Leaf)) (Alt (Leaf))))
+                (let hold (Hold (Alt (Leaf))))
+                "#,
+            )
+            .unwrap();
+
+        let expr = egraph
+            .parser
+            .get_expr_from_string(None, "(Pair (Mid (Leaf)) (Alt (Leaf)))")
+            .unwrap();
+        let report = egraph.delete_closure_expr(&expr).unwrap();
+
+        let deleted_funcs = report
+            .deleted_rows
+            .iter()
+            .map(|row| row.function_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(deleted_funcs, vec!["Mid", "Pair"]);
+        assert_eq!(egraph.get_size("Pair"), 0);
+        assert_eq!(egraph.get_size("Mid"), 0);
+        assert_eq!(egraph.get_size("Alt"), 1);
+        assert_eq!(egraph.get_size("Leaf"), 1);
+        assert_eq!(egraph.get_size("Hold"), 1);
     }
 
     #[test]

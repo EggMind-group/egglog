@@ -637,6 +637,7 @@ impl EGraph {
         let all = imp.all();
         let mut cur = Offset::new(0);
         let mut buf = TaggedRowBuffer::new(imp.spec().arity());
+        let mut offset = 0usize;
         // This somewhat awkward iteration strategy is forced on us by the `scan_bounded` API. We
         // should look into ways to avoid this cludge where the loop body effectively must be
         // repeated at the end. The obvious and idiomatic ways to do this all require
@@ -649,9 +650,11 @@ impl EGraph {
                     if !f(FunctionRow {
                         vals: &row[0..schema_math.func_cols],
                         subsumed,
+                        offset,
                     }) {
                         return;
                     }
+                    offset += 1;
                 }
                 $buf.clear();
             };
@@ -681,14 +684,26 @@ impl EGraph {
             subsume: info.can_subsume,
             func_cols: info.schema.len(),
         };
-        self.db
-            .for_each_row_col_eq_while(table_id, col, value, |_, row| {
-                let subsumed = schema_math.subsume && row[schema_math.subsume_col()] == SUBSUMED;
-                f(FunctionRow {
-                    vals: &row[0..schema_math.func_cols],
-                    subsumed,
-                })
+        let col_idx = col.index();
+        let table = self.db.get_table(table_id);
+        let mut keep_going = true;
+        let mut offset = 0usize;
+        self.scan_table(table, |row| {
+            if !keep_going {
+                return;
+            }
+            let current_offset = offset;
+            offset += 1;
+            if row[col_idx] != value {
+                return;
+            }
+            let subsumed = schema_math.subsume && row[schema_math.subsume_col()] == SUBSUMED;
+            keep_going = f(FunctionRow {
+                vals: &row[0..schema_math.func_cols],
+                subsumed,
+                offset: current_offset,
             });
+        });
     }
 
     /// A basic method for dumping the state of the database to `log::info!`.
@@ -1816,6 +1831,7 @@ struct RowVals<T> {
 pub struct FunctionRow<'a> {
     pub vals: &'a [Value],
     pub subsumed: bool,
+    pub offset: usize,
 }
 
 impl SchemaMath {
