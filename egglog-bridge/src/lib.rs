@@ -675,20 +675,35 @@ impl EGraph {
         mut f: impl FnMut(FunctionRow<'_>) -> bool,
     ) {
         let info = &self.funcs[table];
-        let table_id = info.table;
         let schema_math = SchemaMath {
             tracing: self.tracing,
             subsume: info.can_subsume,
             func_cols: info.schema.len(),
         };
-        self.db
-            .for_each_row_col_eq_while(table_id, col, value, |_, row| {
-                let subsumed = schema_math.subsume && row[schema_math.subsume_col()] == SUBSUMED;
-                f(FunctionRow {
-                    vals: &row[0..schema_math.func_cols],
-                    subsumed,
-                })
-            });
+        let imp = self.db.get_table(info.table);
+        let subset = imp.refine_one(imp.all(), &Constraint::EqConst { col, val: value });
+        let mut cur = Offset::new(0);
+        let mut buf = TaggedRowBuffer::new(imp.spec().arity());
+        macro_rules! drain_buf {
+            ($buf:expr) => {
+                for (_, row) in $buf.non_stale() {
+                    let subsumed =
+                        schema_math.subsume && row[schema_math.subsume_col()] == SUBSUMED;
+                    if !f(FunctionRow {
+                        vals: &row[0..schema_math.func_cols],
+                        subsumed,
+                    }) {
+                        return;
+                    }
+                }
+                $buf.clear();
+            };
+        }
+        while let Some(next) = imp.scan_bounded(subset.as_ref(), cur, 32, &mut buf) {
+            drain_buf!(buf);
+            cur = next;
+        }
+        drain_buf!(buf);
     }
 
     /// A basic method for dumping the state of the database to `log::info!`.
