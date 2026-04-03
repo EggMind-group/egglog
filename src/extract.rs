@@ -158,6 +158,10 @@ struct ExtractionOptions<C: Cost> {
 }
 
 impl<C: Cost + Ord + Eq + Clone + Debug> Extractor<C> {
+    pub(crate) fn costs(&self) -> &HashMap<String, HashMap<Value, C>> {
+        &self.costs
+    }
+
     fn root_variants_with_sort(
         &self,
         egraph: &EGraph,
@@ -877,7 +881,6 @@ impl Extractor<DefaultCost> {
             self.collect_best_tree_anchor_rows(egraph, *child_value, child_sort, out);
         }
     }
-
 }
 
 impl Function {

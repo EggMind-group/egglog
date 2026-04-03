@@ -1,12 +1,12 @@
 use crate::{
+    ResolvedCall, Term, TermDag, TermId,
     ast::{FunctionSubtype, ResolvedExpr, ResolvedFact, ResolvedNCommand},
     proofs::{proof_checker::gather_globals, proof_encoding_helpers::EncodingNames},
     typechecking::FuncType,
     util::{HEntry, HashMap, IndexSet, SymbolGen},
-    ResolvedCall, Term, TermDag, TermId,
 };
 use egglog_ast::generic_ast::Literal;
-use egglog_numeric_id::{define_id, DenseIdMap, NumericId};
+use egglog_numeric_id::{DenseIdMap, NumericId, define_id};
 use std::fmt;
 
 define_id!(
