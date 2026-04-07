@@ -343,6 +343,12 @@ pub struct LightSimplifyReport {
     pub removed_function_rows: usize,
     pub pattern_penalized_nodes: usize,
     pub total_pattern_penalty: f64,
+    pub self_cycle_rows_seen: usize,
+    pub self_cycle_rows_restored: usize,
+    pub extractability_repair_rounds: usize,
+    pub extractability_restored_rows: usize,
+    pub extractability_fallback_used: bool,
+    pub deleted_rows: Vec<DeleteClosureRemovedRow>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -415,6 +421,7 @@ struct LightSimplifyRowInfo {
     row_cost: Option<DefaultCost>,
     penalty: f64,
     weighted_score: f64,
+    has_self_cycle_child: bool,
 }
 
 fn light_anchor_value_cost(
@@ -477,6 +484,12 @@ fn light_anchor_row_penalty(
 ) -> f64 {
     let node_id = format!("function-{}-{}", row.offset, func_name);
     row_penalties.get(&node_id).copied().unwrap_or(0.0)
+}
+
+fn light_anchor_weighted_score(row_cost: Option<DefaultCost>, penalty: f64) -> f64 {
+    row_cost.map_or(f64::INFINITY, |cost| {
+        (cost as f64) * (1.0 + penalty.max(0.0))
+    })
 }
 
 fn light_simplify_root_class(sort: &ArcSort, value: Value) -> Option<DeleteClosureClassKey> {
@@ -2094,10 +2107,12 @@ impl EGraph {
         StdHashMap<DeleteClosureRowKey, LightSimplifyRowInfo>,
         usize,
         f64,
+        usize,
     ) {
         let mut rows = StdHashMap::new();
         let mut pattern_penalized_nodes = 0usize;
         let mut total_pattern_penalty = 0.0f64;
+        let mut self_cycle_rows_seen = 0usize;
         for (function_name, function) in self.functions.iter() {
             if function.decl.subtype != FunctionSubtype::Constructor
                 || function.decl.unextractable
@@ -2134,6 +2149,15 @@ impl EGraph {
                             }
                         })
                         .collect::<Vec<_>>();
+                    let output_class = DeleteClosureClassKey {
+                        sort: output_sort.name().to_string(),
+                        value: output_value,
+                    };
+                    let has_self_cycle_child =
+                        child_classes.iter().any(|child_class| child_class == &output_class);
+                    if has_self_cycle_child {
+                        self_cycle_rows_seen += 1;
+                    }
                     let row_cost = light_anchor_row_cost(self, function, &row, global_costs);
                     let penalty = light_anchor_row_penalty(function_name, &row, row_penalties);
                     if penalty > 0.0 {
@@ -2146,20 +2170,22 @@ impl EGraph {
                             key_values,
                         },
                         LightSimplifyRowInfo {
-                            output_class: DeleteClosureClassKey {
-                                sort: output_sort.name().to_string(),
-                                value: output_value,
-                            },
+                            output_class,
                             child_classes,
                             row_cost,
                             penalty,
-                            weighted_score: row_cost
-                                .map_or(f64::INFINITY, |cost| cost as f64 + penalty),
+                            weighted_score: light_anchor_weighted_score(row_cost, penalty),
+                            has_self_cycle_child,
                         },
                     );
                 });
         }
-        (rows, pattern_penalized_nodes, total_pattern_penalty)
+        (
+            rows,
+            pattern_penalized_nodes,
+            total_pattern_penalty,
+            self_cycle_rows_seen,
+        )
     }
 
     fn compute_light_simplify_live_rows(
@@ -2205,6 +2231,122 @@ impl EGraph {
             }
         }
         (live_rows, live_classes)
+    }
+
+    fn compute_light_simplify_extractable_rows(
+        &self,
+        kept_rows: &StdHashSet<DeleteClosureRowKey>,
+        rows: &StdHashMap<DeleteClosureRowKey, LightSimplifyRowInfo>,
+    ) -> (
+        StdHashSet<DeleteClosureRowKey>,
+        StdHashSet<DeleteClosureClassKey>,
+    ) {
+        let mut extractable_rows: StdHashSet<DeleteClosureRowKey> = StdHashSet::new();
+        let mut extractable_classes: StdHashSet<DeleteClosureClassKey> = StdHashSet::new();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for row_key in kept_rows {
+                if extractable_rows.contains(row_key) {
+                    continue;
+                }
+                let Some(row_info) = rows.get(row_key) else {
+                    continue;
+                };
+                if !row_info
+                    .child_classes
+                    .iter()
+                    .all(|child_class| extractable_classes.contains(child_class))
+                {
+                    continue;
+                }
+                if extractable_rows.insert(row_key.clone()) {
+                    changed = true;
+                }
+                if extractable_classes.insert(row_info.output_class.clone()) {
+                    changed = true;
+                }
+            }
+        }
+        (extractable_rows, extractable_classes)
+    }
+
+    fn repair_light_simplify_keep_set(
+        &self,
+        root_class: &DeleteClosureClassKey,
+        kept_rows: &mut StdHashSet<DeleteClosureRowKey>,
+        rows: &StdHashMap<DeleteClosureRowKey, LightSimplifyRowInfo>,
+    ) -> (
+        StdHashSet<DeleteClosureRowKey>,
+        StdHashSet<DeleteClosureClassKey>,
+        usize,
+        usize,
+        usize,
+        bool,
+    ) {
+        let mut repair_rounds = 0usize;
+        let mut restored_rows = 0usize;
+        let mut self_cycle_rows_restored = 0usize;
+        let mut fallback_used = false;
+
+        loop {
+            let (extractable_rows, extractable_classes) =
+                self.compute_light_simplify_extractable_rows(kept_rows, rows);
+            if extractable_classes.contains(root_class) {
+                return (
+                    extractable_rows,
+                    extractable_classes,
+                    repair_rounds,
+                    restored_rows,
+                    self_cycle_rows_restored,
+                    fallback_used,
+                );
+            }
+
+            let candidate = rows
+                .iter()
+                .filter(|(row_key, _)| !kept_rows.contains(*row_key))
+                .filter(|(_, row_info)| {
+                    row_info
+                        .child_classes
+                        .iter()
+                        .all(|child_class| extractable_classes.contains(child_class))
+                })
+                .min_by(|(row_a, info_a), (row_b, info_b)| {
+                    let self_rank_a = if info_a.has_self_cycle_child { 1u8 } else { 0u8 };
+                    let self_rank_b = if info_b.has_self_cycle_child { 1u8 } else { 0u8 };
+                    self_rank_a
+                        .cmp(&self_rank_b)
+                        .then_with(|| info_a.weighted_score.total_cmp(&info_b.weighted_score))
+                        .then_with(|| info_a.penalty.total_cmp(&info_b.penalty))
+                        .then_with(|| info_a.row_cost.cmp(&info_b.row_cost))
+                        .then_with(|| row_a.function_name.cmp(&row_b.function_name))
+                        .then_with(|| row_a.key_values.cmp(&row_b.key_values))
+                })
+                .map(|(row_key, row_info)| (row_key.clone(), row_info.has_self_cycle_child));
+
+            let Some((candidate_key, candidate_is_self_cycle)) = candidate else {
+                fallback_used = true;
+                let all_rows = rows.keys().cloned().collect::<StdHashSet<_>>();
+                let (extractable_rows, extractable_classes) =
+                    self.compute_light_simplify_extractable_rows(&all_rows, rows);
+                return (
+                    extractable_rows,
+                    extractable_classes,
+                    repair_rounds,
+                    restored_rows,
+                    self_cycle_rows_restored,
+                    fallback_used,
+                );
+            };
+
+            repair_rounds += 1;
+            restored_rows += 1;
+            if candidate_is_self_cycle {
+                self_cycle_rows_restored += 1;
+            }
+            kept_rows.insert(candidate_key);
+        }
     }
 
     pub fn delete_closure_expr(&mut self, expr: &Expr) -> Result<DeleteClosureReport, Error> {
@@ -2410,7 +2552,7 @@ impl EGraph {
     /// best-tree neighborhood. Instead it:
     /// - computes global extraction costs for constructor rows
     /// - groups constructor rows by their output eclass
-    /// - ranks rows inside each eclass by `row_cost + optional penalty`
+    /// - ranks rows inside each eclass by `row_cost * (1 + optional penalty)`
     /// - keeps a theta-controlled subset per eclass
     /// - runs a rooted live analysis from the requested root eclass over the
     ///   kept rows
@@ -2627,7 +2769,7 @@ impl EGraph {
         let extractor =
             Extractor::compute_costs_from_rootsorts(None, self, TreeAdditiveCostModel::default());
         let global_costs = canonicalize_light_simplify_costs(self, extractor.costs());
-        let (rows, pattern_penalized_nodes, total_pattern_penalty) =
+        let (rows, pattern_penalized_nodes, total_pattern_penalty, self_cycle_rows_seen) =
             self.snapshot_light_simplify_rows(&global_costs, row_penalties);
 
         let before_nodes = rows.len();
@@ -2699,8 +2841,16 @@ impl EGraph {
             }
         }
 
+        let (
+            extractable_rows,
+            _extractable_classes,
+            extractability_repair_rounds,
+            extractability_restored_rows,
+            self_cycle_rows_restored,
+            extractability_fallback_used,
+        ) = self.repair_light_simplify_keep_set(&root_class, &mut kept_rows, &rows);
         let (live_rows, live_classes) =
-            self.compute_light_simplify_live_rows(&root_class, &kept_rows, &rows);
+            self.compute_light_simplify_live_rows(&root_class, &extractable_rows, &rows);
         let after_nodes = live_rows.len();
         let after_classes = live_classes.len();
         let removed_rows: Vec<DeleteClosureRowKey> = rows
@@ -2709,6 +2859,33 @@ impl EGraph {
             .cloned()
             .collect();
         let redundancy_pruned_nodes = removed_rows.len().saturating_sub(threshold_pruned_nodes);
+        let mut deleted_rows = removed_rows
+            .iter()
+            .map(|row_key| {
+                let row_info = rows.get(row_key).unwrap();
+                DeleteClosureRemovedRow {
+                    function_name: row_key.function_name.clone(),
+                    key_values: row_key.key_values.iter().map(|value| value.rep() as i64).collect(),
+                    output_class: DeleteClosureClass {
+                        sort: row_info.output_class.sort.clone(),
+                        value: row_info.output_class.value.rep() as i64,
+                    },
+                    child_classes: row_info
+                        .child_classes
+                        .iter()
+                        .map(|class_key| DeleteClosureClass {
+                            sort: class_key.sort.clone(),
+                            value: class_key.value.rep() as i64,
+                        })
+                        .collect(),
+                }
+            })
+            .collect::<Vec<_>>();
+        deleted_rows.sort_by(|a, b| {
+            a.function_name
+                .cmp(&b.function_name)
+                .then_with(|| a.key_values.cmp(&b.key_values))
+        });
 
         let mut removed_function_rows = 0usize;
         let mut table_actions: HashMap<egglog_bridge::FunctionId, egglog_bridge::TableAction> =
@@ -2740,6 +2917,12 @@ impl EGraph {
             removed_function_rows,
             pattern_penalized_nodes,
             total_pattern_penalty,
+            self_cycle_rows_seen,
+            self_cycle_rows_restored,
+            extractability_repair_rounds,
+            extractability_restored_rows,
+            extractability_fallback_used,
+            deleted_rows,
         })
     }
 
@@ -3281,6 +3464,50 @@ mod tests {
         let (sort, value) = egraph.eval_expr(&expr).unwrap();
         let (term, _cost) = egraph.extract_value_to_string(&sort, value).unwrap();
         assert_eq!(term, "(Hold (Alt (LeafB)))");
+    }
+
+    #[test]
+    fn light_simplify_repairs_self_cycle_only_keep_set() {
+        let mut egraph = EGraph::default();
+        egraph
+            .parse_and_run_program(
+                None,
+                r#"
+                (datatype Expr
+                  (Seed)
+                  (Zero)
+                  (Self Expr Expr)
+                  (Hold Expr))
+                (let expr (Hold (Seed)))
+                (union (Seed) (Self (Seed) (Zero)))
+                "#,
+            )
+            .unwrap();
+
+        let expr = egraph.parser.get_expr_from_string(None, "expr").unwrap();
+        let anchor = egraph.extract_light_simplify_anchor_expr(&expr).unwrap();
+
+        let mut penalties = StdHashMap::new();
+        let seed_function = egraph.functions.get("Seed").unwrap();
+        egraph
+            .backend
+            .for_each(seed_function.backend_id, |row: egglog_bridge::FunctionRow| {
+                penalties.insert(format!("function-{}-Seed", row.offset), 1000.0);
+            });
+
+        let report = egraph
+            .light_simplify_expr_with_anchor_and_penalties(&expr, &anchor, 1.1, &penalties)
+            .unwrap();
+
+        assert_eq!(report.self_cycle_rows_seen, 1);
+        assert!(report.extractability_repair_rounds >= 1);
+        assert!(report.extractability_restored_rows >= 1);
+        assert_eq!(report.extractability_fallback_used, false);
+
+        let (sort, value) = egraph.eval_expr(&expr).unwrap();
+        let (term, _cost) = egraph.extract_value_to_string(&sort, value).unwrap();
+        assert!(term == "(Hold (Seed))" || term == "(Hold (Self (Seed) (Zero)))");
+        assert_eq!(egraph.get_size("Seed"), 1);
     }
 
     #[test]
